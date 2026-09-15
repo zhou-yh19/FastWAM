@@ -3,6 +3,7 @@ import json
 import argparse
 from collections import defaultdict
 import pandas as pd
+import math
 
 def format_time(seconds):
     """Format seconds as a human-readable duration string.
@@ -26,7 +27,7 @@ def format_time(seconds):
         remaining_seconds = remaining % 60
         return f"{hours:02d}h{minutes:02d}m{remaining_seconds:02d}s"
 
-def summarize_results(output_dir, *, ckpt=None, config=None):
+def summarize_results(output_dir):
     """Summarize all evaluation results.
 
     Args:
@@ -193,7 +194,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
     df = pd.DataFrame(df_data)
     
     # Use the last checkpoint path component as the title
-    ckpt_path = ckpt if ckpt is not None else os.environ.get('CKPT', '')
+    ckpt_path = os.environ.get('CKPT', '')
     title = os.path.basename(ckpt_path) if ckpt_path else 'Results'
     
     # Transpose the DataFrame and use Task Suite as column names
@@ -271,8 +272,8 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
     with open(summary_file, 'w') as f:
         json.dump({
             'run_id': os.path.basename(output_dir),
-            'ckpt': ckpt if ckpt is not None else os.environ.get('CKPT', ''),
-            'config': config if config is not None else os.environ.get('CONFIG', ''),
+            'ckpt': os.environ.get('CKPT', ''), # Checkpoint path
+            'config': os.environ.get('CONFIG', ''), # Config path
             'suite_stats': suite_stats_output,
             'task_results': task_results,
             'overall': overall_stats

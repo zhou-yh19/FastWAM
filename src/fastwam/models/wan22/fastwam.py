@@ -15,6 +15,47 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 logger = get_logger(__name__)
 
 
+def randn_like_with_generator(
+    reference: torch.Tensor, generator: Optional[torch.Generator] = None
+) -> torch.Tensor:
+    """`torch.randn_like`, but honouring an optional generator.
+
+    `torch.randn_like` takes no `generator`, so the shape/device/dtype have to be passed
+    explicitly to get reproducible noise.
+    """
+    if generator is None:
+        return torch.randn_like(reference)
+    return torch.randn(
+        reference.shape,
+        generator=generator,
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+
+
+def resolve_training_timestep(
+    scheduler,
+    timestep: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Draw a random training timestep, or broadcast a caller-supplied one to the batch."""
+    if timestep is None:
+        return scheduler.sample_training_t(batch_size=batch_size, device=device, dtype=dtype)
+
+    t = torch.as_tensor(timestep, device=device, dtype=dtype).reshape(-1)
+    if t.numel() == 1:
+        # `repeat` rather than `expand`: downstream `add_noise`/`pre_dit` reshape this.
+        return t.repeat(batch_size)
+    if t.numel() != batch_size:
+        raise ValueError(
+            f"`timestep` must be a scalar or have {batch_size} elements, got {t.numel()}."
+        )
+    return t
+
+
 class FastWAM(torch.nn.Module):
     """MoT world model with video/action experts."""
 
@@ -38,7 +79,6 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
-        compile_training_denoise: bool = False,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -85,8 +125,6 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
-        self.compile_training_denoise = bool(compile_training_denoise)
-        self.mot.compile_training_layers = self.compile_training_denoise
 
         self.to(self.device)
 
@@ -105,7 +143,8 @@ class FastWAM(torch.nn.Module):
         action_dit_config: dict[str, Any] | None = None,
         action_dit_pretrained_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
-        mot_checkpoint_mixed_attn: bool = False,
+        uninitialized_dit: bool = False,
+        mot_checkpoint_mixed_attn: bool = True,
         video_train_shift: float = 5.0,
         video_infer_shift: float = 5.0,
         video_num_train_timesteps: int = 1000,
@@ -114,7 +153,6 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
-        compile_training_denoise: bool = False,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -131,6 +169,7 @@ class FastWAM(torch.nn.Module):
             dit_config=video_dit_config,
             skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
             load_text_encoder=load_text_encoder,
+            uninitialized_dit=uninitialized_dit,
         )
 
         video_expert = components.dit
@@ -172,8 +211,10 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
-            compile_training_denoise=compile_training_denoise,
         )
+        # Records that the video expert holds uninitialized memory, so `load_checkpoint` must
+        # refuse a checkpoint that does not cover every tensor.
+        model._dit_requires_full_checkpoint = bool(uninitialized_dit)
         model.model_paths = {
             "video_dit": components.dit_path,
             "vae": components.vae_path,
@@ -246,18 +287,14 @@ class FastWAM(torch.nn.Module):
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
-        if tiled:
-            raise NotImplementedError("Batched VAE encoding does not support tiled encoding.")
-        if not hasattr(self, "_vae_encode_compiled"):
-            self._vae_encode_compiled = torch.compile(
-                self.vae.model.encode,
-                backend="cudagraphs",
-                fullgraph=True,
-            )
-        return self._vae_encode_compiled(
-            video_tensor.to(self.device),
-            self.vae.scale,
-        ).clone()
+        z = self.vae.encode(
+            video_tensor,
+            device=self.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
+        return z
 
     @torch.no_grad()
     def _encode_input_image_latents_tensor(self, input_image: torch.Tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -267,10 +304,11 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
-        if tiled:
-            raise NotImplementedError("Batched VAE image encoding does not support tiled encoding.")
         image = input_image.to(device=self.device)[0].unsqueeze(1)
-        return self.vae.model.encode(image.unsqueeze(0), self.vae.scale)
+        z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        if isinstance(z, list):
+            z = z[0].unsqueeze(0)
+        return z
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
@@ -284,6 +322,12 @@ class FastWAM(torch.nn.Module):
 
     def build_inputs(self, sample, tiled: bool = False):
         video = sample["video"]
+        if "context" not in sample or "context_mask" not in sample:
+            raise ValueError(
+                "FastWAM training requires `sample['context']` and `sample['context_mask']`."
+            )
+        context = sample["context"]
+        context_mask = sample["context_mask"]
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -338,15 +382,6 @@ class FastWAM(torch.nn.Module):
         
         input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         input_latents = self._encode_video_latents(input_video, tiled=tiled)
-        context = sample.get("context")
-        context_mask = sample.get("context_mask")
-        if context is None and context_mask is None:
-            prompt = sample.get("prompt")
-            if prompt is None:
-                raise ValueError("FastWAM training requires `context/context_mask` or `prompt`.")
-            context, context_mask = self.encode_prompt(prompt)
-        elif context is None or context_mask is None:
-            raise ValueError("`context` and `context_mask` must both exist when either is provided.")
 
         first_frame_latents = None
         fuse_flag = False
@@ -456,70 +491,21 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
-    def _joint_denoise_core(
+    def training_loss(
         self,
-        latents_video: torch.Tensor,
-        latents_action: torch.Tensor,
-        timestep_video: torch.Tensor,
-        timestep_action: torch.Tensor,
-        context: torch.Tensor,
-        context_mask: torch.Tensor,
-        attention_mask: torch.Tensor,
-        fuse_vae_embedding_in_latents: bool,
-        action_condition: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the tensor-only video/action core shared by training and inference."""
-        (
-            video_tokens,
-            t_video,
-            t_mod_video,
-            context_video,
-            context_mask_video,
-            freqs_video,
-            f_video,
-            h_video,
-            w_video,
-            _tokens_per_frame,
-        ) = self.video_expert.prepare(
-            x=latents_video,
-            timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
-            action=action_condition,
-            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
-        )
-        (
-            action_tokens,
-            _t_action,
-            t_mod_action,
-            context_action,
-            context_mask_action,
-            freqs_action,
-        ) = self.action_expert.prepare(
-            action_tokens=latents_action,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
-        )
-        video_tokens, action_tokens = self.mot.forward_joint_core(
-            video_tokens=video_tokens,
-            action_tokens=action_tokens,
-            video_freqs=freqs_video,
-            action_freqs=freqs_action,
-            video_t_mod=t_mod_video,
-            action_t_mod=t_mod_action,
-            video_context=context_video,
-            video_context_mask=context_mask_video,
-            action_context=context_action,
-            action_context_mask=context_mask_action,
-            attention_mask=attention_mask,
-        )
-        return (
-            self.video_expert.post(video_tokens, t_video, f_video, h_video, w_video),
-            self.action_expert.post(action_tokens),
-        )
+        sample,
+        tiled: bool = False,
+        timestep_video: Optional[torch.Tensor] = None,
+        timestep_action: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+    ):
+        """Denoising regression loss.
 
-    def training_loss(self, sample, tiled: bool = False):
+        By default the timesteps and the noise are drawn at random, which is what training
+        wants. Passing `timestep_video`/`timestep_action`/`generator` pins them instead, so
+        the same sample evaluates to the same number every time -- see `Wan22Trainer.evaluate`,
+        which uses that to keep the logged eval curves comparable across steps.
+        """
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -529,8 +515,10 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
-        noise_video = torch.randn_like(input_latents)
-        timestep_video = self.train_video_scheduler.sample_training_t(
+        noise_video = randn_like_with_generator(input_latents, generator)
+        timestep_video = resolve_training_timestep(
+            self.train_video_scheduler,
+            timestep_video,
             batch_size=batch_size,
             device=self.device,
             dtype=input_latents.dtype,
@@ -541,8 +529,10 @@ class FastWAM(torch.nn.Module):
         if inputs["first_frame_latents"] is not None:
             latents[:, :, 0:1] = inputs["first_frame_latents"]
 
-        noise_action = torch.randn_like(action)
-        timestep_action = self.train_action_scheduler.sample_training_t(
+        noise_action = randn_like_with_generator(action, generator)
+        timestep_action = resolve_training_timestep(
+            self.train_action_scheduler,
+            timestep_action,
             batch_size=batch_size,
             device=self.device,
             dtype=action.dtype,
@@ -550,26 +540,60 @@ class FastWAM(torch.nn.Module):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-        patch_t, patch_h, patch_w = (int(size) for size in self.video_expert.patch_size)
-        latent_t, latent_h, latent_w = latents.shape[-3:]
-        tokens_per_frame = (latent_h // patch_h) * (latent_w // patch_w)
-        attention_mask = self._build_mot_attention_mask(
-            video_seq_len=(latent_t // patch_t) * tokens_per_frame,
-            action_seq_len=noisy_action.shape[1],
-            video_tokens_per_frame=tokens_per_frame,
-            device=latents.device,
-        )
-        pred_video, pred_action = self._joint_denoise_core(
-            latents_video=latents,
-            latents_action=noisy_action,
-            timestep_video=timestep_video,
-            timestep_action=timestep_action,
+        video_pre = self.video_expert.pre_dit(
+            x=latents,
+            timestep=timestep_video,
             context=context,
             context_mask=context_mask,
-            attention_mask=attention_mask,
+            action=action,
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
-            action_condition=action,
         )
+
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+
+        video_tokens = video_pre["tokens"]
+        action_tokens = action_pre["tokens"]
+
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_tokens.shape[1],
+            action_seq_len=action_tokens.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_tokens.device,
+        )
+        tokens_out = self.mot(
+            embeds_all={
+                "video": video_tokens,
+                "action": action_tokens,
+            },
+            attention_mask=attention_mask,
+            freqs_all={
+                "video": video_pre["freqs"],
+                "action": action_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": video_pre["t_mod"],
+                "action": action_pre["t_mod"],
+            },
+        )
+
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
         include_initial_video_step = inputs["first_frame_latents"] is None
         if inputs["first_frame_latents"] is not None:
@@ -619,26 +643,57 @@ class FastWAM(torch.nn.Module):
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        patch_t, patch_h, patch_w = (int(size) for size in self.video_expert.patch_size)
-        latent_t, latent_h, latent_w = latents_video.shape[-3:]
-        tokens_per_frame = (latent_h // patch_h) * (latent_w // patch_w)
-        attention_mask = self._build_mot_attention_mask(
-            video_seq_len=(latent_t // patch_t) * tokens_per_frame,
-            action_seq_len=latents_action.shape[1],
-            video_tokens_per_frame=tokens_per_frame,
-            device=latents_video.device,
-        )
-        return self._joint_denoise_core(
-            latents_video=latents_video,
-            latents_action=latents_action,
-            timestep_video=timestep_video,
-            timestep_action=timestep_action,
+        video_pre = self.video_expert.pre_dit(
+            x=latents_video,
+            timestep=timestep_video,
             context=context,
             context_mask=context_mask,
-            attention_mask=attention_mask,
+            action=gt_action,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
-            action_condition=gt_action,
         )
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_pre["tokens"].shape[1],
+            action_seq_len=action_pre["tokens"].shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+
+        tokens_out = self.mot(
+            embeds_all={
+                "video": video_pre["tokens"],
+                "action": action_pre["tokens"],
+            },
+            attention_mask=attention_mask,
+            freqs_all={
+                "video": video_pre["freqs"],
+                "action": action_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": video_pre["t_mod"],
+                "action": action_pre["t_mod"],
+            },
+        )
+
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        return pred_video, pred_action
 
     @torch.no_grad()
     def _predict_action_noise(
@@ -700,41 +755,6 @@ class FastWAM(torch.nn.Module):
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
         return pred_action
 
-    def _denoise_action_with_video_cache(
-        self,
-        latents_action: torch.Tensor,
-        timestep_action: torch.Tensor,
-        context: torch.Tensor,
-        context_mask: torch.Tensor,
-        video_cache_k: list[torch.Tensor],
-        video_cache_v: list[torch.Tensor],
-        action_attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        (
-            action_tokens,
-            _t,
-            action_t_mod,
-            action_context,
-            action_context_mask,
-            action_freqs,
-        ) = self.action_expert.prepare(
-            action_tokens=latents_action,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
-        )
-        action_tokens = self.mot.forward_action_with_video_cache_tensor(
-            action_tokens=action_tokens,
-            action_freqs=action_freqs,
-            action_t_mod=action_t_mod,
-            action_context=action_context,
-            action_context_mask=action_context_mask,
-            video_cache_k=video_cache_k,
-            video_cache_v=video_cache_v,
-            action_attention_mask=action_attention_mask,
-        )
-        return self.action_expert.post(action_tokens)
-
     @torch.no_grad()
     def _predict_action_noise_with_cache(
         self,
@@ -746,7 +766,6 @@ class FastWAM(torch.nn.Module):
         attention_mask: torch.Tensor,
         video_seq_len: int,
     ) -> torch.Tensor:
-        """Legacy dictionary-cache path retained for the optional IDM variant."""
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
@@ -786,7 +805,6 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
-        compile_action_infer: bool = False,
     ) -> dict[str, Any]:
         self.eval()
         if test_action_with_infer_action:
@@ -804,7 +822,6 @@ class FastWAM(torch.nn.Module):
                 rand_device=rand_device,
                 tiled=tiled,
                 proprio=proprio.clone() if proprio is not None else None,
-                compile_action_infer=compile_action_infer,
             )["action"]
         
         if input_image.ndim == 3:
@@ -898,29 +915,6 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio,
             )
 
-        patch_t, patch_h, patch_w = (int(size) for size in self.video_expert.patch_size)
-        tokens_per_frame = (latent_h // patch_h) * (latent_w // patch_w)
-        joint_attention_mask = self._build_mot_attention_mask(
-            video_seq_len=(latent_t // patch_t) * tokens_per_frame,
-            action_seq_len=latents_action.shape[1],
-            video_tokens_per_frame=tokens_per_frame,
-            device=self.device,
-        )
-        if compile_action_infer:
-            if action is not None:
-                raise ValueError(
-                    "`compile_action_infer=True` does not support action conditioning in `infer_joint`."
-                )
-            if not hasattr(self, "_joint_denoise_core_compiled_inference"):
-                self._joint_denoise_core_compiled_inference = torch.compile(
-                    self._joint_denoise_core,
-                    mode="reduce-overhead",
-                    fullgraph=True,
-                )
-            joint_denoise_core = self._joint_denoise_core_compiled_inference
-        else:
-            joint_denoise_core = self._joint_denoise_core
-
         infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
@@ -939,21 +933,18 @@ class FastWAM(torch.nn.Module):
             infer_timesteps_action,
             infer_deltas_action,
         ):
-            if compile_action_infer:
-                torch.compiler.cudagraph_mark_step_begin()
             timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_video_posi, pred_action_posi = joint_denoise_core(
+            pred_video_posi, pred_action_posi = self._predict_joint_noise(
                 latents_video=latents_video,
                 latents_action=latents_action,
                 timestep_video=timestep_video,
                 timestep_action=timestep_action,
                 context=context,
                 context_mask=context_mask,
-                attention_mask=joint_attention_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
-                action_condition=action,
+                gt_action=action,
             )
             pred_video = pred_video_posi
             pred_action = pred_action_posi
@@ -991,7 +982,6 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
-        compile_action_infer: bool = False,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -1069,18 +1059,7 @@ class FastWAM(torch.nn.Module):
             dtype=first_frame_latents.dtype,
             device=self.device,
         )
-        (
-            video_tokens,
-            _t_video,
-            video_t_mod,
-            video_context,
-            video_context_mask,
-            video_freqs,
-            _f_video,
-            _h_video,
-            _w_video,
-            tokens_per_frame,
-        ) = self.video_expert.prepare(
+        video_pre = self.video_expert.pre_dit(
             x=first_frame_latents,
             timestep=timestep_video,
             context=context,
@@ -1088,47 +1067,23 @@ class FastWAM(torch.nn.Module):
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
         )
-        video_seq_len = int(video_tokens.shape[1])
+        video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
             action_seq_len=latents_action.shape[1],
-            video_tokens_per_frame=tokens_per_frame,
-            device=video_tokens.device,
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
         )
-        video_attention_mask = attention_mask[:video_seq_len, :video_seq_len]
-        action_attention_mask = attention_mask[video_seq_len:, :]
-        if compile_action_infer:
-            if not hasattr(self, "_prefill_video_cache_compiled"):
-                self._prefill_video_cache_compiled = torch.compile(
-                    self.mot.prefill_video_cache_tensor,
-                    mode="reduce-overhead",
-                    fullgraph=True,
-                )
-            if not hasattr(self, "_denoise_action_with_video_cache_compiled"):
-                self._denoise_action_with_video_cache_compiled = torch.compile(
-                    self._denoise_action_with_video_cache,
-                    mode="reduce-overhead",
-                    fullgraph=True,
-                )
-            prefill_video_cache = self._prefill_video_cache_compiled
-            denoise_action_with_video_cache = self._denoise_action_with_video_cache_compiled
-        else:
-            prefill_video_cache = self.mot.prefill_video_cache_tensor
-            denoise_action_with_video_cache = self._denoise_action_with_video_cache
-        if compile_action_infer:
-            torch.compiler.cudagraph_mark_step_begin()
-        video_cache_k, video_cache_v = prefill_video_cache(
-            video_tokens=video_tokens,
-            video_freqs=video_freqs,
-            video_t_mod=video_t_mod,
-            video_context=video_context,
-            video_context_mask=video_context_mask,
-            video_attention_mask=video_attention_mask,
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
-        if compile_action_infer:
-            # Inductor reduce-overhead may return graph-owned buffers that are overwritten on replay.
-            video_cache_k = [cache.clone() for cache in video_cache_k]
-            video_cache_v = [cache.clone() for cache in video_cache_v]
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -1137,18 +1092,16 @@ class FastWAM(torch.nn.Module):
             shift_override=sigma_shift,
         )
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
-            if compile_action_infer:
-                torch.compiler.cudagraph_mark_step_begin()
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_action_posi = denoise_action_with_video_cache(
+            pred_action_posi = self._predict_action_noise_with_cache(
                 latents_action=latents_action,
                 timestep_action=timestep_action,
                 context=context,
                 context_mask=context_mask,
-                video_cache_k=video_cache_k,
-                video_cache_v=video_cache_v,
-                action_attention_mask=action_attention_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
             )
             pred_action = pred_action_posi
 
@@ -1209,12 +1162,37 @@ class FastWAM(torch.nn.Module):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None):
-        payload = torch.load(path, map_location="cpu")
+        # `mmap=True` pages tensors in as they are copied to the GPU instead of reading the whole
+        # ~11 GiB payload into anonymous memory first (measured 11.8 -> ~0 GiB host RSS, 11.2s ->
+        # 2.1s). Older checkpoints written with the legacy serialization cannot be mmapped, so
+        # fall back rather than making them unloadable.
+        try:
+            payload = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+        except (RuntimeError, ValueError) as exc:
+            logger.info("mmap load unavailable for %s (%s); falling back to a full read.", path, exc)
+            payload = torch.load(path, map_location="cpu")
+        # When the video expert was allocated uninitialized, any tensor the checkpoint does not
+        # supply holds undefined memory rather than a random-but-valid init, so it must not be
+        # left unloaded.
+        requires_full = bool(getattr(self, "_dit_requires_full_checkpoint", False))
+
+        def _reject_missing(missing: list[str], target: str) -> None:
+            if requires_full and missing:
+                raise RuntimeError(
+                    f"Video expert was built uninitialized but the checkpoint leaves "
+                    f"{len(missing)} {target} tensor(s) undefined: {missing[:10]}. Rebuild the "
+                    f"model with `uninitialized_dit=False` to load this checkpoint."
+                )
+
         if "mot" in payload:
-            self.mot.load_state_dict(payload["mot"], strict=False)
+            incompatible = self.mot.load_state_dict(payload["mot"], strict=False)
+            _reject_missing(list(incompatible.missing_keys), "MoT")
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
-            self.video_expert.load_state_dict(payload["dit"], strict=False)
+            incompatible = self.video_expert.load_state_dict(payload["dit"], strict=False)
+            # A legacy `dit` payload covers only the video expert, so the action expert keeps its
+            # ActionDiT init -- valid, but the video expert itself must still be fully covered.
+            _reject_missing(list(incompatible.missing_keys), "video expert")
         else:
             raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
         if self.proprio_encoder is not None:

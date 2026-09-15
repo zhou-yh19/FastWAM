@@ -1,0 +1,85 @@
+# @package _global_
+# ^ A hydra directive, not a comment. Without it every key below nests under `task.`
+#   and composition fails with "Could not override 'data@task.data'". Do not delete.
+#
+# TA2 monocular training task template
+#
+# 1. Copy configs/data/ta2_mono_template.yaml -> configs/data/<your-task>.yaml, edit
+#    dataset_dirs and text_embedding_cache_dir
+# 2. Copy this file -> configs/task/<your-task>.yaml
+# 3. Point `override /data:` below at the file from step 1 (no .yaml)
+# 4. Set wandb, or leave it disabled
+# 5. Run: bash scripts/launch_train.sh <your-task>
+#
+# The filename deliberately omits the ZeRO stage -- that comes from the ZERO env var:
+#   bash scripts/launch_train.sh <your-task>            # ZeRO-1
+#   ZERO=2 bash scripts/launch_train.sh <your-task>     # ZeRO-2
+#
+# Resume and LR anneal need no separate config; override on the command line. See docs/GUIDE.md.
+
+defaults:
+  - override /data: ta2_mono_template   # <- your data config name
+  - override /model: fastwam
+  - _self_
+
+# Global batch = batch_size * gradient_accumulation_steps * n_gpu (8 * 2 * 8 = 128 here).
+#
+# When resuming, batch_size must match the original run. The state stores batch_in_epoch
+# (a batch count, not a sample count), so changing it silently resumes from the wrong
+# position -- no error, no crash. See docs/GUIDE.md.
+batch_size: 8
+gradient_accumulation_steps: 2
+num_workers: 12
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+weight_decay: 1e-2
+
+# With max_steps null, the total is derived:
+#   steps/epoch = ceil(ceil(len(dataset) / (batch_size * n_gpu)) / grad_accum)
+#   max_steps   = steps/epoch * num_epochs
+# Note len() is the frame count and sliding windows overlap heavily, so an "epoch" is
+# not one pass over independent samples.
+num_epochs: 10
+max_steps: null
+
+# Resume (null = train from scratch)
+#   directory .../state/step_<N>     -> full restore (weights + Adam momentum + LR
+#                                       schedule + dataloader cursor + RNG)
+#   file      .../weights/step_<N>.pt -> weights only, i.e. fine-tune
+# Dispatch lives in trainer.py `_resume_or_load_checkpoint`.
+#
+# Usually set on the command line rather than here:
+#   bash scripts/launch_train.sh <your-task> \
+#     resume=./runs/<task>/<RUN_ID>/checkpoints/state/step_<N> \
+#     additional_steps=<M>
+resume: null
+resume_reinit_lr: false     # true rebuilds the LR curve (anneal); false keeps the stored schedule
+additional_steps: null      # required when resuming: max_steps becomes global_step + this
+
+log_every: 10
+save_every: 4000
+eval_every: 1000
+eval_num_inference_steps: 10
+
+# Normalization stats
+#   fresh run: leave unset -- computed at startup, saved to runs/<task>/<RUN_ID>/
+#   resuming:  must reuse the original run's file, or the action scale drifts
+#
+# data:
+#   train:
+#     pretrained_norm_stats: ./runs/<task>/<RUN_ID>/dataset_stats.json
+
+wandb:
+  # Off by default so a copy of this template runs with no further edits. Enabling it
+  # requires credentials (~/.netrc api.wandb.ai, or WANDB_API_KEY); launch_train.sh checks.
+  enabled: false
+  workspace: null           # your wandb entity
+  project: null
+  # Setting `name` here has no effect: train_zeroN.sh always overrides it with the task
+  # name. Pass wandb.name=... on the command line instead (command line wins).
+  group: null
+  mode: online

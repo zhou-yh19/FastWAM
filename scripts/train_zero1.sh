@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Enable NCCL diagnostics: next time a collective hangs, the watchdog captures which line each
+# rank was stuck on instead of just "timed out" with no traceback. The 2026-08-29 hang had
+# FlightRecorder disabled, so we only got the symptom (30 min timeout), not the cause.
+export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"
+export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
+# Report which rank diverged from the collective sequence:
+export TORCH_NCCL_DESYNC_DEBUG="${TORCH_NCCL_DESYNC_DEBUG:-1}"
+# Async error handling: non-blocking collectives return errors promptly rather than hanging:
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+
 NPROC_PER_NODE="${1:?Usage: bash scripts/train_zero1.sh <nproc_per_node> [hydra_overrides...]}"
 shift
 

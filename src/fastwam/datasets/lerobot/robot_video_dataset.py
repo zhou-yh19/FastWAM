@@ -23,8 +23,6 @@ logger = get_logger(__name__)
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
 class RobotVideoDataset(torch.utils.data.Dataset):
-    base_dataset_cls = BaseLerobotDataset
-
     def __init__(
         self,
         dataset_dirs,
@@ -34,7 +32,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         camera_key=None,
         processor=None,
         text_embedding_cache_dir=None,
-        use_text_embed_cache=True,
         context_len=128,
         pretrained_norm_stats=None,
         val_set_proportion=0.05,
@@ -43,12 +40,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
-        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
+        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", "ta2"(via processor), or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
-        tolerance_s: Optional[float] = None,
-        video_backend: Optional[str] = None,
     ):
-        self.lerobot_dataset = self.base_dataset_cls(
+        self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
             obs_size=num_frames,
@@ -56,9 +51,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
-            image_subsample_stride=action_video_freq_ratio,
-            tolerance_s=tolerance_s,
-            video_backend=video_backend,
         )
     
         self.num_frames = num_frames
@@ -75,7 +67,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
-        self.use_text_embed_cache = bool(use_text_embed_cache)
         self.context_len = context_len
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
@@ -94,8 +85,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if processor is not None:
             if isinstance(processor, DictConfig):
                 processor = instantiate(processor)
-            if self.lerobot_dataset.presample_images:
-                processor.num_image_steps = len(self.video_sample_indices)
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
@@ -153,16 +142,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
         num_cameras = 1
         if video.ndim == 5:
-            if not self.lerobot_dataset.presample_images:
-                video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            if not self.lerobot_dataset.presample_images:
-                video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
             T_video, C, H, W = video.shape
-        if not self.lerobot_dataset.presample_images:
-            image_is_pad = image_is_pad[self.video_sample_indices]
+        image_is_pad = image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "robotwin":
@@ -198,7 +184,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             else:
                 raise ValueError(
                     f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
-                    "Expected one of: horizontal, vertical, robotwin."
+                    "Expected one of: horizontal, vertical, robotwin, or null "
+                    "(use processor.camera_mosaic='ta2' for TA2 head/wrist mosaic)."
                 )
         else:
             video = video.squeeze(0)  # [T_video, C, H, W]
@@ -229,21 +216,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             task = self.override_instruction
         instruction = DEFAULT_PROMPT.format(task=task)
 
+        context, context_mask = self._get_cached_text_context(instruction)
+        # NOTE: to keep consistent with wan2.2's behavior
+        context[~context_mask] = 0.0
+        context_mask = torch.ones_like(context_mask)
+        
         data = {
             "video": video,
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
+            "context": context,
+            "context_mask": context_mask,
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
-        if self.use_text_embed_cache:
-            context, context_mask = self._get_cached_text_context(instruction)
-            # NOTE: to keep consistent with wan2.2's behavior
-            context[~context_mask] = 0.0
-            data["context"] = context
-            data["context_mask"] = torch.ones_like(context_mask)
         return data
 
     def _get_cached_text_context(self, prompt: str):

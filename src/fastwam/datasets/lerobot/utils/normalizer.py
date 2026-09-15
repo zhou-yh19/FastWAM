@@ -79,12 +79,16 @@ class LinearNormalizer:
         return batch
     
     def backward(self, batch: Dict[str, Dict[str, torch.Tensor]]) -> torch.Tensor:
-        for key, norm in self.normalizers["action"].items():
-            batch["action"][key] = norm.backward(batch["action"][key])
+        if "action" in batch:
+            for key, norm in self.normalizers["action"].items():
+                if key in batch["action"]:
+                    batch["action"][key] = norm.backward(batch["action"][key])
 
-        for key, norm in self.normalizers["state"].items():
-            batch["state"][key] = norm.backward(batch["state"][key])
-        
+        if "state" in batch:
+            for key, norm in self.normalizers["state"].items():
+                if key in batch["state"]:
+                    batch["state"][key] = norm.backward(batch["state"][key])
+
         return batch
 
 

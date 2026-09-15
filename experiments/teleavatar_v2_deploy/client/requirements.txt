@@ -1,0 +1,7 @@
+# On the robot-side control machine (ROS 2 Humble system Python is fine)
+numpy
+Pillow
+PyYAML
+requests
+opencv-python
+# ROS2 + GStreamer come from apt (rclpy, python3-gi, ...)

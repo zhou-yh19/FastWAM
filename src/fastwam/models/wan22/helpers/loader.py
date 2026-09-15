@@ -9,13 +9,43 @@ from .io import ModelConfig, hash_model_file, load_state_dict
 from .state_dict_converters import (
     wan_video_vae_state_dict_converter,
 )
-from ..wan_video_dit import WanVideoDiT
+from ..wan_video_dit import WanVideoDiT, precompute_freqs_cis_3d
 from ..wan_video_text_encoder import HuggingfaceTokenizer, WanTextEncoder
 from ..wan_video_vae import WanVideoVAE38
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 SKIPPED_PRETRAIN_SENTINEL = "SKIPPED_PRETRAIN"
+
+
+def build_dit_uninitialized(dit_config: dict[str, Any], device: str, torch_dtype: torch.dtype) -> WanVideoDiT:
+    """Allocate the 5B video DiT directly on `device` without materializing it on the host.
+
+    `WanVideoDiT(**cfg)` runs its initializers in fp32 on the CPU, so the default path peaks at
+    ~19 GiB of host RSS for weights that are about to be overwritten by a checkpoint. Meta-device
+    construction skips the initializers entirely, and `to_empty` allocates uninitialized storage
+    straight on the GPU. Only safe when every tensor is subsequently loaded from a checkpoint --
+    the caller must verify `load_state_dict` reports no missing keys.
+    """
+    with torch.device("meta"):
+        model = WanVideoDiT(**dit_config)
+    buffers = [name for name, _ in model.named_buffers()]
+    if buffers:
+        # `to_empty` would leave these holding uninitialized garbage, and buffers are not part of
+        # the checkpoint's parameter set, so they would never be overwritten.
+        raise RuntimeError(
+            f"WanVideoDiT gained registered buffers {buffers}; uninitialized construction would "
+            "leave them undefined. Populate them explicitly before using this path."
+        )
+    # Cast on the meta device *before* allocating: the initializers run in fp32, so
+    # `to_empty(cuda)` first would transiently allocate 18.6 GiB of fp32 storage just to free
+    # half of it on the bf16 cast -- enough to OOM a 24 GB card. Casting while still on meta
+    # costs nothing and allocates 9.3 GiB once.
+    model = model.to(dtype=torch_dtype).to_empty(device=device)
+    # `freqs` is a plain attribute rather than a registered buffer, so `to_empty` leaves it on the
+    # meta device. It is a pure function of `attn_head_dim`, so recompute it here.
+    model.freqs = precompute_freqs_cis_3d(int(model.attn_head_dim))
+    return model
 
 
 @dataclass
@@ -148,6 +178,7 @@ def load_wan22_ti2v_5b_components(
     dit_config: dict[str, Any] | None = None,
     skip_dit_load_from_pretrain: bool = False,
     load_text_encoder: bool = True,
+    uninitialized_dit: bool = False,
 ):
     logger.info("Loading Wan2.2-TI2V-5B components...")
     start = time.time()
@@ -168,11 +199,20 @@ def load_wan22_ti2v_5b_components(
         tokenizer_config.download_if_necessary()
 
     if skip_dit_load_from_pretrain:
-        logger.info(
-            "Skipping pretrained video DiT load (`skip_dit_load_from_pretrain=True`); "
-            "initializing video expert randomly and expecting checkpoint override."
-        )
-        dit: WanVideoDiT = WanVideoDiT(**validated_dit_config).to(device=device, dtype=torch_dtype)
+        dit: WanVideoDiT
+        if uninitialized_dit:
+            logger.info(
+                "Skipping pretrained video DiT load and host-side init (`uninitialized_dit=True`); "
+                "allocating the video expert directly on %s and expecting a full checkpoint override.",
+                device,
+            )
+            dit = build_dit_uninitialized(validated_dit_config, device=device, torch_dtype=torch_dtype)
+        else:
+            logger.info(
+                "Skipping pretrained video DiT load (`skip_dit_load_from_pretrain=True`); "
+                "initializing video expert randomly and expecting checkpoint override."
+            )
+            dit = WanVideoDiT(**validated_dit_config).to(device=device, dtype=torch_dtype)
         dit_path = SKIPPED_PRETRAIN_SENTINEL
     else:
         dit_model_config.download_if_necessary()

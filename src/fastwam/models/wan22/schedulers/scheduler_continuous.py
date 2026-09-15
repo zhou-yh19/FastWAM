@@ -36,6 +36,26 @@ class WanContinuousFlowMatchScheduler:
         timestep = sigma * float(self.num_train_timesteps)
         return timestep.to(dtype=dtype)
 
+    def build_training_t_grid(
+        self, num_points: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Deterministic quantile grid over the *training* timestep distribution.
+
+        `sample_training_t` draws u ~ U(0,1) and maps it through `_phi`, so taking the
+        midpoints of a uniform u-grid gives an evenly-weighted, reproducible stand-in for
+        that distribution. Used by evaluation to estimate the loss without the variance of
+        a fresh random timestep each call.
+
+        Deliberately not `build_inference_schedule`: that grid takes left endpoints starting
+        at sigma=1, which is correct for sampling but biased towards high noise (and includes
+        the degenerate pure-noise point) when the goal is to average.
+        """
+        if num_points <= 0:
+            raise ValueError(f"`num_points` must be positive, got {num_points}")
+        u = (torch.arange(num_points, device=device, dtype=torch.float32) + 0.5) / float(num_points)
+        sigma = self._phi(u, self.shift)
+        return (sigma * float(self.num_train_timesteps)).to(dtype=dtype)
+
     def training_weight(self, timestep: torch.Tensor) -> torch.Tensor:
         t = timestep.to(dtype=torch.float32)
         steps = float(self.num_train_timesteps)

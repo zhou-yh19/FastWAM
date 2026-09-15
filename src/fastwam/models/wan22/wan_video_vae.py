@@ -1067,18 +1067,19 @@ class WanVideoVAE(nn.Module):
             2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
             3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
-        self.register_buffer("mean", torch.tensor(mean), persistent=False)
-        self.register_buffer("inv_std", torch.tensor(std).reciprocal(), persistent=False)
+        # Pin fp32 explicitly: these are plain attributes, so `nn.Module.to(dtype)` never
+        # converts them, and they stayed fp32 under the fp32 default dtype. Callers that build
+        # this module under a bf16 default dtype would otherwise silently round the latent
+        # normalization constants (0.1234567 -> 0.12353515625).
+        self.mean = torch.tensor(mean, dtype=torch.float32)
+        self.std = torch.tensor(std, dtype=torch.float32)
+        self.scale = [self.mean, 1.0 / self.std]
 
         # init model
         self.model = VideoVAE_(z_dim=z_dim).eval().requires_grad_(False)
         self.upsampling_factor = 8
         self.temporal_downsample_factor = 4
         self.z_dim = z_dim
-
-    @property
-    def scale(self):
-        return [self.mean, self.inv_std]
 
 
     def build_1d_mask(self, length, left_bound, right_bound, border_width):
@@ -1219,10 +1220,21 @@ class WanVideoVAE(nn.Module):
 
 
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        raise NotImplementedError(
-            "WanVideoVAE.encode() legacy per-video loop is disabled. "
-            "Call `vae.model.encode(batched_video, vae.scale)` for fixed-shape batched encode."
-        )
+        # videos = [video.to("cpu") for video in videos]
+        hidden_states = []
+        for video in videos:
+            video = video.unsqueeze(0)
+            if tiled:
+                raise NotImplementedError("Tiled encoding is not allowed yet.")
+                tile_size = (tile_size[0] * self.upsampling_factor, tile_size[1] * self.upsampling_factor)
+                tile_stride = (tile_stride[0] * self.upsampling_factor, tile_stride[1] * self.upsampling_factor)
+                hidden_state = self.tiled_encode(video, device, tile_size, tile_stride)
+            else:
+                hidden_state = self.single_encode(video, device)
+            hidden_state = hidden_state.squeeze(0)
+            hidden_states.append(hidden_state)
+        hidden_states = torch.stack(hidden_states)
+        return hidden_states
 
 
     def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
@@ -1365,8 +1377,11 @@ class WanVideoVAE38(WanVideoVAE):
             0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
             0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744
         ]
-        self.register_buffer("mean", torch.tensor(mean), persistent=False)
-        self.register_buffer("inv_std", torch.tensor(std).reciprocal(), persistent=False)
+        # Pin fp32 explicitly -- see the note on WanVideoVAE.__init__ above: plain attributes are
+        # untouched by `nn.Module.to(dtype)`, so a bf16 default dtype would silently round these.
+        self.mean = torch.tensor(mean, dtype=torch.float32)
+        self.std = torch.tensor(std, dtype=torch.float32)
+        self.scale = [self.mean, 1.0 / self.std]
 
         # init model
         self.model = VideoVAE38_(z_dim=z_dim, dim=dim).eval().requires_grad_(False)

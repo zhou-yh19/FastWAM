@@ -22,14 +22,28 @@ log_every: 10
 save_every: 100
 eval_every: 50
 eval_num_inference_steps: 10
+# Eval determinism: the eval set and the noise/timesteps used for `val_loss` are pinned so
+# that consecutive evals are comparable. See `Wan22Trainer.evaluate`.
+eval_seed: 12345              # fixed seed for eval sample choice + loss noise
+eval_num_loss_timesteps: 5    # K: timesteps on the fixed grid (cheap -- reuses the loaded sample)
+eval_num_loss_samples: 2      # N: samples per rank for val_loss (expensive -- each decodes video)
 
 # training
 gradient_accumulation_steps: 1
+# How long a NCCL collective may stall before the watchdog aborts the job. Shorter than
+# DeepSpeed's 1800s default so a rank-divergence hang surfaces in minutes, not half an hour.
+dist_timeout_sec: 600
 mixed_precision: "bf16" # one of: [no, fp16, bf16]
 seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
+# Optional after accelerate state/ resume (see docs/GUIDE.md):
+resume_reinit_lr: false
+additional_steps: null
+# Warmup fraction when resume_reinit_lr rebuilds the schedule. Keep 0.05 to drop to a lower
+# peak after a plateau; set 0.0 for an anneal-to-zero tail that must start at the current LR.
+resume_warmup_frac: 0.05
 
 # wandb
 wandb:

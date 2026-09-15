@@ -5,6 +5,7 @@ import torch
 import numpy as np
 from copy import deepcopy
 from ..utils.normalizer import LinearNormalizer, NormMode
+from ..transforms.image import compose_ta2_mosaic
 from fastwam.utils.pytorch_utils import dict_apply
 from fastwam.utils.logging_config import get_logger
 from .base_processor import BaseProcessor
@@ -40,11 +41,17 @@ class FastWAMProcessor(BaseProcessor):
 
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
-        num_image_steps: Optional[int] = None,
+
+        # If "ta2": ToTensor(keep native res) -> letterbox each cam to its tile
+        # once -> paste onto a fixed mosaic. Output is a single camera tensor.
+        camera_mosaic: Optional[str] = None,
+        ta2_canvas_size: Optional[List[int]] = None,
+        ta2_head_tile: Optional[List[int]] = None,
+        ta2_wrist_tile: Optional[List[int]] = None,
+        ta2_fill: float = 0.5,
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
-        self.num_image_steps = num_obs_steps if num_image_steps is None else num_image_steps
         self.num_output_cameras = num_output_cameras
         self.action_output_dim = action_output_dim
         self.proprio_output_dim = proprio_output_dim
@@ -55,6 +62,22 @@ class FastWAMProcessor(BaseProcessor):
         # image
         self.train_transforms = train_transforms
         self.val_transforms = val_transforms
+        self.camera_mosaic = None if camera_mosaic in (None, "", "null") else str(camera_mosaic)
+        # Defaults are the monocular (left-eye) geometry, matching compose_ta2_mosaic.
+        # Every TA2 config sets these explicitly; they only matter for ad-hoc construction.
+        self.ta2_canvas_size = list(ta2_canvas_size) if ta2_canvas_size is not None else [352, 256]
+        self.ta2_head_tile = list(ta2_head_tile) if ta2_head_tile is not None else [256, 256]
+        self.ta2_wrist_tile = list(ta2_wrist_tile) if ta2_wrist_tile is not None else [80, 128]
+        self.ta2_fill = float(ta2_fill)
+
+        if self.camera_mosaic not in (None, "ta2"):
+            raise ValueError(
+                f"Unsupported camera_mosaic={self.camera_mosaic!r}. Expected null or 'ta2'."
+            )
+        if self.camera_mosaic == "ta2" and self.num_output_cameras != 1:
+            raise ValueError(
+                "camera_mosaic='ta2' produces a single mosaic image; set num_output_cameras=1."
+            )
 
         self._is_train = None
 
@@ -226,23 +249,44 @@ class FastWAMProcessor(BaseProcessor):
             for trans in current_transforms:
                 image = trans(image)
             
-            meta_shape = [self.num_image_steps] + shape
+            meta_shape = [self.num_obs_steps] + shape
             assert image.shape == meta_shape, \
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 
             processed_images.append(image)
-        pixel_values = torch.stack(processed_images, dim=0) # [num_input_cameras, T, C, H, W]
-        
-        if self.num_output_cameras > pixel_values.shape[0]:
-            out = torch.zeros((self.num_output_cameras,) + pixel_values.shape[1:], device=pixel_values.device, dtype=pixel_values.dtype)
-            out[0: pixel_values.shape[0]] = pixel_values
-            sample["pixel_values"] = out
-        elif self.num_output_cameras < pixel_values.shape[0]:
-            logger.warning(f"num_output_cameras {self.num_output_cameras} is less than the number of cameras in data {pixel_values.shape[0]}, "
-                           f"truncating the input to the first {self.num_output_cameras} cameras.")
-            sample["pixel_values"] = pixel_values[:self.num_output_cameras]
+
+        if self.camera_mosaic == "ta2":
+            # Native-res cameras (possibly different HxW) -> tiles -> one canvas.
+            # Do this here so we never stack unequal shapes or downscale twice.
+            mosaic = compose_ta2_mosaic(
+                processed_images,
+                canvas_size=tuple(self.ta2_canvas_size),
+                head_tile=tuple(self.ta2_head_tile),
+                wrist_tile=tuple(self.ta2_wrist_tile),
+                fill=self.ta2_fill,
+                antialias=True,
+            )  # [T, C, H, W]
+            sample["pixel_values"] = mosaic.unsqueeze(0)  # [1, T, C, H, W]
         else:
-            sample["pixel_values"] = pixel_values
+            pixel_values = torch.stack(processed_images, dim=0)  # [num_input_cameras, T, C, H, W]
+
+            if self.num_output_cameras > pixel_values.shape[0]:
+                out = torch.zeros(
+                    (self.num_output_cameras,) + pixel_values.shape[1:],
+                    device=pixel_values.device,
+                    dtype=pixel_values.dtype,
+                )
+                out[0 : pixel_values.shape[0]] = pixel_values
+                sample["pixel_values"] = out
+            elif self.num_output_cameras < pixel_values.shape[0]:
+                logger.warning(
+                    f"num_output_cameras {self.num_output_cameras} is less than the number of "
+                    f"cameras in data {pixel_values.shape[0]}, truncating the input to the first "
+                    f"{self.num_output_cameras} cameras."
+                )
+                sample["pixel_values"] = pixel_values[: self.num_output_cameras]
+            else:
+                sample["pixel_values"] = pixel_values
 
         # Copy action before transform for open-loop evaluation, 
         # disabled for training dataset as it may cause collating key problem.

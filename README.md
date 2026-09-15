@@ -1,430 +1,391 @@
-# FastWAM
+# FastWAM — LeRobot Training & Teleavatar 2.0 Deployment
 
-Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future Imagination?**
+A fork of [FastWAM](https://github.com/zhou-yh19/FastWAM) focused on one path end to end:
+**train a world-action model on LeRobot-format robot data, then serve it on a Teleavatar 2.0
+(TA2) dual-arm robot over ROS 2.**
 
-[![English](https://img.shields.io/badge/README-English-111111.svg)](./README.md)
-[![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-d14836.svg)](./README_zh.md)
+Nothing here is specific to one task. You supply a LeRobot dataset; the configs, scripts and
+deploy chain are parameterised by task name throughout.
 
-[![arXiv](https://img.shields.io/badge/arXiv-2603.16666-b31b1b.svg)](https://arxiv.org/abs/2603.16666)
-[![Project Page](https://img.shields.io/badge/Project_Page-Fast--WAM-2ea44f.svg)](https://yuantianyuan01.github.io/FastWAM/)
-[![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-f7c843)](https://huggingface.co/yuanty/fastwam)
-[![Hugging Face Dataset - LIBERO](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20LIBERO-f7c843)](https://huggingface.co/datasets/yuanty/LIBERO-fastwam)
-[![Hugging Face Dataset - RoboTwin](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20RoboTwin-f7c843)](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)
+> Looking for the original paper code (LIBERO / RoboTwin benchmarks)? Its configs still ship in
+> `configs/{data,task}/`, but the benchmark documentation lives upstream at
+> [zhou-yh19/FastWAM](https://github.com/zhou-yh19/FastWAM). This document covers the
+> LeRobot + TA2 path instead.
 
-This repository contains the training and evaluation code for FastWAM on LIBERO / RoboTwin.
+| | |
+|---|---|
+| **Input** | LeRobot 2.x dataset (`meta/` + `data/` + `videos/`), 3 cameras, 72-d action/state |
+| **Model** | Wan2.2-TI2V-5B video expert + 1.0B action expert (MoT), flow matching |
+| **Output** | 16-d action chunks at 20 Hz → ROS 2 joint/gripper commands at 200 Hz |
+| **Hardware** | Training: 8×A100/A800 80 GB, DeepSpeed ZeRO-1/2. Serving: 1 GPU ≥24 GB |
 
-## What's New
+---
 
-FastWAM is now faster, better suited to large-scale datasets, and more flexible
-for research. This update brings substantially faster training and inference,
-native LeRobot v3.0 support, and a new model that can switch between acting with
-and without future imagination.
+## Contents
 
-### ⚡ Approximately 2x faster inference
+- [How the pieces fit](#how-the-pieces-fit)
+- [Install](#install)
+- [Data: what the code expects](#data-what-the-code-expects)
+- [Train](#train)
+- [Deploy on TA2](#deploy-on-ta2)
+- [Moving checkpoints between machines](#moving-checkpoints-between-machines)
+- [Analysis tools](#analysis-tools)
+- [Conventions worth knowing](#conventions-worth-knowing)
+- [Further reading](#further-reading)
+- [Citation](#citation)
 
-End-to-end FastWAM inference is now approximately **2x faster**, including text
-encoding and VAE encoding:
+---
 
-- **NVIDIA H20:** 470 ms → 210 ms
-- **NVIDIA RTX 4090:** 190 ms → 110 ms
+## How the pieces fit
 
-The accelerated path is enabled by default for LIBERO with
-`EVALUATION.compile_action_infer=true`. We gratefully acknowledge
-[PR #43](https://github.com/yuantianyuan01/FastWAM/pull/43) for proposing the
-optimization ideas that inspired this work. Existing checkpoints remain fully
-compatible with the accelerated inference path.
-
-### 🚀 Approximately 10% faster training
-
-FastWAM training is approximately **10% faster on NVIDIA H20 GPUs**. The new
-training path combines a compiled denoising core with batched VAE encoding and
-a lightweight CUDA Graph backend. Enable denoising compilation with:
-
-```bash
-bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 \
-  model.compile_training_denoise=true
+```
+LeRobot dataset ──transcode──> *_lowres ──transcode──> *_mono
+  meta/tasks.jsonl                                       │
+        │                                                │
+        └──precompute_text_embeds──> text_embeds_cache/   │
+                                            │            │
+                              configs/data/<task>.yaml ───┤
+                              configs/task/<task>.yaml    │
+                                            │            │
+                                    launch_train.sh ──────┘
+                                            │
+                              runs/<task>/<RUN_ID>/
+                                ├── checkpoints/weights/step_*.pt
+                                ├── dataset_stats.json      ← must travel with the weights
+                                └── config.yaml
+                                            │
+                        ┌───────────────────┴───────────────────┐
+                        │                                       │
+            start_local_serve_ws.sh                    make_task_map.py
+            (GPU host, WebSocket)                      (taskmap.json)
+                        │
+            run_task_ws.sh  (robot host, ROS 2 + RTP video)
 ```
 
-Both cached text embeddings and on-the-fly T5 encoding are supported. The
-latter skips text-cache preprocessing and is more convenient, at the cost of
-approximately 10% lower training throughput.
+Two hosts are normal: a GPU box runs inference, the robot-side machine runs ROS 2 and
+receives camera frames over RTP. They talk over WebSocket + msgpack.
 
-### 📦 Native LeRobot 2.1 and 3.0 support
+---
 
-FastWAM now supports both **LeRobot 2.1 and LeRobot 3.0** datasets. LeRobot 3.0's
-chunked parquet and video layout scales better to large datasets, with faster
-data loading and dataset-statistics computation as the dataset grows.
-
-Download the released LeRobot 3.0 LIBERO dataset from
-[Hugging Face](https://huggingface.co/datasets/yuanty/LIBERO-fastwam) and select
-the v3.0 data config:
-
-```bash
-huggingface-cli download yuanty/LIBERO-fastwam \
-  --repo-type dataset \
-  --include "lerobot_v30/**" \
-  --local-dir ./data
-
-python scripts/train.py task=libero_uncond_2cam224_1e-4 \
-  data=libero_2cam_lerobot_v30
-```
-
-For another LeRobot 3.0 dataset, copy
-`configs/data/libero_2cam_lerobot_v30.yaml`, update `train.dataset_dirs`, and
-select the new config with `data=<config_name>`. Existing LeRobot 2.1 configs
-continue to work unchanged.
-
-### 🧠 Optional IDM: one model, two thinking modes
-
-Optional IDM is a new FastWAM variant that supports **two inference modes in a
-single model**:
-
-- **IDM mode:** imagine the future video first, then predict actions.
-- **First-frame mode (Fast-WAM):** skip test-time future imagination and predict
-  actions directly from the current observation.
-
-Download the released Optional IDM checkpoint from
-[Hugging Face](https://huggingface.co/yuanty/fastwam):
-
-```bash
-huggingface-cli download yuanty/fastwam \
-  libero_optional_idm_2cam224.pt \
-  libero_optional_idm_2cam224_dataset_stats.json \
-  --local-dir ./checkpoints/fastwam_release
-```
-
-Train the optional-IDM variant once:
-
-```bash
-bash scripts/train_zero1.sh 8 task=libero_optional_idm_2cam224_1e-4
-```
-
-Then choose either inference mode at evaluation time without retraining, making
-it easy to study when future imagination helps:
-
-```bash
-python experiments/libero/run_libero_manager.py \
-  task=libero_optional_idm_2cam224_1e-4 \
-  ckpt=./checkpoints/fastwam_release/libero_optional_idm_2cam224.pt \
-  EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/libero_optional_idm_2cam224_dataset_stats.json \
-  EVALUATION.sigma_shift=1.0 \
-  +EVALUATION.action_infer_mode=idm \
-  MULTIRUN.num_gpus=8
-```
-
-Replace `idm` with `first_frame` to use the Fast-WAM inference mode.
-
-The released checkpoint, trained with action scheduler shift `1.0`, achieves
-the following success rates on the full LIBERO benchmark (40 tasks, 50 episodes
-per task):
-
-| Inference mode | Spatial | Goal | Object | Long | Average |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| IDM | 99.0% | 98.6% | 99.6% | 97.0% | **98.55%** |
-| First-frame (Fast-WAM) | 98.2% | 97.8% | 99.2% | 95.8% | **97.75%** |
-
-### Other improvements
-
-- The action scheduler shift now defaults to `1.0` for both training and
-  evaluation; shifts from `1.0` to `3.0` perform similarly in our experiments.
-  When evaluating the original released checkpoints, set
-  `EVALUATION.sigma_shift=5.0` to reproduce the original setting.
-- Upgraded LIBERO evaluation with persistent model workers, dynamic task
-  scheduling, bad-GPU quarantine, failure recovery, and resumable results.
-- Optimized action-only inference for IDM and Optional IDM: `infer_action`
-  returns actions and video latents directly, while VAE decoding is performed
-  only by `infer_joint` when video output is requested, eliminating redundant
-  computation in action-only deployments.
-
-## Index
-
-- [File Structure](#file-structure)
-- [Environment Setup](#environment-setup)
-- [Model Preparation](#model-preparation)
-- [Dataset Download](#dataset-download)
-- [Inference with Released Checkpoints](#inference-with-released-checkpoints)
-- [Training](#training)
-- [Inference with Your Trained Checkpoints](#inference-with-your-trained-checkpoints)
-- [Acknowledgements](#acknowledgements)
-- [BibTeX](#bibtex)
-
-## File Structure
-
-```text
-FastWAM/
-├── configs/
-│   ├── data/                 # Dataset configs (LIBERO, RoboTwin, etc.)
-│   ├── model/                # Model architecture and component configs
-│   └── task/                 # Task-level configs (training task names)
-├── scripts/
-│   ├── train.py
-│   ├── train_zero1.sh        # Deepspeed zero1 training entrypoint
-│   ├── preprocess_action_dit_backbone.py  # Preprocess ActionDiT backbone before training
-│   └── precompute_text_embeds.py  # Precompute T5 text embedding cache before training
-├── experiments/
-│   ├── libero/
-│   │   └── run_libero_manager.py
-│   └── robotwin/
-│       └── run_robotwin_manager.py
-├── src/fastwam/              # Core code
-├── runs/                     # Training outputs (ckpt, logs)
-├── checkpoints/              # Pretrained or external checkpoints
-├── data/                     # Data directory
-└── evaluate_results/         # Inference / evaluation results
-```
-
-## Environment Setup
+## Install
 
 ```bash
 conda create -n fastwam python=3.10 -y
 conda activate fastwam
 pip install -U pip
-pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 \
+  --extra-index-url https://download.pytorch.org/whl/cu128
 pip install -e .
 ```
 
-## Model Preparation
-
-This step is required before both training and inference.
-
-Step 1: set the Wan model directory first (opional, default `./checkpoints`):
+Then pre-generate the ActionDiT backbone once (it is interpolated from the Wan2.2 DiT, not
+downloaded):
 
 ```bash
 mkdir -p checkpoints
 export DIFFSYNTH_MODEL_BASE_PATH="$(pwd)/checkpoints"
-```
 
-Step 2: pre-generate the ActionDiT backbone (interpolated from Wan22 DiT):
-
-```bash
-# uncond (fastwam)
 python scripts/preprocess_action_dit_backbone.py \
   --model-config configs/model/fastwam.yaml \
   --output checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt \
-  --device cuda \
-  --dtype bfloat16
+  --device cuda --dtype bfloat16
 ```
 
-## Dataset Download
+`DIFFSYNTH_MODEL_BASE_PATH` must be set for every training and serving process — the Wan
+component loader resolves all model paths relative to it.
 
-### LIBERO
+The robot-side client has a different, much lighter dependency set and **must** run on the
+system interpreter, because ROS 2 Humble's C extensions are built for it. See
+[docs/GUIDE.md](./docs/GUIDE.md).
 
-The preprocessed LIBERO dataset used by Fast-WAM is available at:
+---
 
-- https://huggingface.co/datasets/yuanty/LIBERO-fastwam
+## Data: what the code expects
 
-Download all compressed files first, then extract them all:
+A LeRobot 2.x directory tree:
+
+```
+data/<your_dataset>/
+├── meta/
+│   ├── info.json          # fps, total_episodes, total_frames, feature shapes
+│   ├── tasks.jsonl        # {"task_index": 0, "task": "<natural-language instruction>"}
+│   ├── episodes.jsonl
+│   └── episodes_stats.jsonl
+├── data/chunk-000/episode_NNNNNN.parquet     # action + observation.state
+└── videos/chunk-000/<camera>/episode_NNNNNN.mp4
+```
+
+Three cameras are expected by the TA2 configs: `head_camera`, `left_color`, `right_color`.
+Each records a side-by-side stereo pair; only the **left eye** is used for training.
+
+### 1. Transcode the video
+
+Source video is typically 3840×1920 HEVC. Decoding one 33-frame window costs ~3.2 CPU-seconds,
+which starves the GPU (~94 % of wall time spent waiting on data). Two stages fix that:
 
 ```bash
-mkdir -p data/libero_mujoco3.3.2
-cd data/libero_mujoco3.3.2
+# stage 1: original SBS -> downscaled SBS
+DATASETS="<your_dataset>" bash scripts/transcode.sh
 
-# Run after downloading all 4 tar.gz files
-for f in *.tar.gz; do
-  tar -xzf "$f"
-done
+# stage 2: SBS -> left eye only (what training consumes)
+DATASETS="<your_dataset>" MODE=mono bash scripts/transcode.sh
+
+# required: rewrite meta/info.json, or LeRobot still reports the source resolution
+python scripts/patch_transcoded_meta.py --mode lowres data/<your_dataset>_lowres
+python scripts/patch_transcoded_meta.py --mode mono   data/<your_dataset>_mono
 ```
 
-The extracted directory structure should be:
+`DATASETS` takes dataset **base names** (no `_lowres` / `_mono` suffix), relative to
+`SRC_ROOT` (default `./data`). Omit it and the script discovers every dataset with the right
+source suffix. Output keeps the LeRobot layout: `meta/` and `data/` are symlinked back to the
+source, only `videos/` is rewritten. Re-running skips finished files.
 
-```text
-data/libero_mujoco3.3.2/
-├── libero_10_no_noops_lerobot/
-├── libero_goal_no_noops_lerobot/
-├── libero_object_no_noops_lerobot/
-└── libero_spatial_no_noops_lerobot/
-```
-
-### RoboTwin
-
-The preprocessed RoboTwin dataset used by Fast-WAM is available at:
-
-- https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam
-
-Download all split archive files first, then concatenate and extract:
+### 2. Write two configs
 
 ```bash
-mkdir -p data/robotwin2.0
-cd data/robotwin2.0
-
-# Run after downloading all robotwin2.0.tar.gz.part-* files
-cat robotwin2.0.tar.gz.part-* | tar -xzf -
+cp configs/data/ta2_mono_template.yaml configs/data/<your_task>.yaml
+cp configs/task/ta2_mono_template.yaml configs/task/<your_task>.yaml
 ```
 
-The extracted directory structure should be:
+In the **data** config set `dataset_dirs` (one or more `*_mono` dirs) and
+`text_embedding_cache_dir`. In the **task** config point `override /data:` at your data config
+name and fill in `wandb`. Both templates document every field inline.
 
-```text
-data/robotwin2.0/
-└── robotwin2.0/
-    ├── data/
-    ├── meta/
-    └── videos/
-```
+Camera resolutions in `shape_meta.images` must match the transcoded video exactly — a
+mismatch produces silently wrong results, not an error.
 
-If you also keep:
+### 3. Precompute text embeddings
 
-```text
-data/robotwin2.0/dataset_stats.json
-```
-
-in the root directory, it can be used directly as the statistics file for the current configs in this repo. You can also recompute it.
-
-## Inference with Released Checkpoints
-
-The released checkpoints and their corresponding dataset stats are available on [Hugging Face](https://huggingface.co/yuanty/fastwam).
-
-Optional: download released checkpoints and dataset stats from Hugging Face:
+The umT5-XXL text encoder is ~11 GB. Training and serving both read cached embeddings instead
+of loading it:
 
 ```bash
-pip install -U huggingface_hub
-
-huggingface-cli download yuanty/fastwam \
-  libero_uncond_2cam224.pt \
-  libero_uncond_2cam224_dataset_stats.json \
-  libero_optional_idm_2cam224.pt \
-  libero_optional_idm_2cam224_dataset_stats.json \
-  robotwin_uncond_3cam_384.pt \
-  robotwin_uncond_3cam_384_dataset_stats.json \
-  --local-dir ./checkpoints/fastwam_release
+python scripts/precompute_text_embeds.py task=<your_task>
 ```
 
-After downloading, the local directory is expected to contain:
+This reads instructions straight from each dataset's `meta/tasks.jsonl` and writes
+`<sha256 of the formatted prompt>.t5_len128.wan22ti2v5b.pt` into `text_embedding_cache_dir`.
+Because the filename is a hash of the exact prompt text, **any** wording difference — including
+whitespace — produces a file the trainer will not find.
 
-```text
-checkpoints/fastwam_release/
-├── libero_uncond_2cam224.pt
-├── libero_uncond_2cam224_dataset_stats.json
-├── libero_optional_idm_2cam224.pt
-├── libero_optional_idm_2cam224_dataset_stats.json
-├── robotwin_uncond_3cam_384.pt
-└── robotwin_uncond_3cam_384_dataset_stats.json
-```
+---
 
-Before running the `LIBERO` benchmark, install the official LIBERO environment first
-from the [LIBERO repository](https://github.com/Lifelong-Robot-Learning/LIBERO).
-Then run this final step:
+## Train
 
 ```bash
-pip install mujoco==3.3.2
+bash scripts/launch_train.sh <your_task>
 ```
 
-The `mujoco` environment should ideally stay consistent with the LIBERO data version.
+That is the whole command. It starts a tmux session with two windows: `train`, and `prune` —
+the latter is **not optional**, since each ZeRO state snapshot is ~80 GB and will fill the disk
+without it.
 
-We have already copied the `RoboTwin` evaluation-related code into `third_party/RoboTwin`.
-You still need to follow the official RoboTwin instructions from the
-[RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin) to finish environment installation and download the required assets, then create the policy symlink:
+| Variable | Default | Meaning |
+|---|---|---|
+| `ZERO` | `1` | DeepSpeed stage, 1 or 2 |
+| `NPROC` | `8` | GPUs per node |
+| `KEEP` | `2` | ZeRO state snapshots to retain |
+| `SESSION` | `fastwam_<task>` | tmux session name |
+| `CONDA_ENV` | `fastwam` | conda env to activate |
+| `DRY_RUN` | — | print the command, start nothing |
+
+Any extra argument is passed through to hydra, so resume and LR-anneal need no new config file:
 
 ```bash
-ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwin/policy/fastwam_policy"
+# resume full state (weights + Adam momentum + LR schedule + dataloader cursor + RNG)
+bash scripts/launch_train.sh <your_task> \
+  resume=./runs/<your_task>/<RUN_ID>/checkpoints/state/step_<N> \
+  additional_steps=<M>
+
+# LR anneal: rebuild the schedule over the remaining steps
+bash scripts/launch_train.sh <your_task> \
+  resume=./runs/<your_task>/<RUN_ID>/checkpoints/state/step_<N> \
+  resume_reinit_lr=true additional_steps=<M> \
+  resume_warmup_frac=0.0 learning_rate=<lr at the resume point>
+
+# ZeRO-2 on 4 GPUs
+ZERO=2 NPROC=4 bash scripts/launch_train.sh <your_task>
 ```
 
-Optional: evaluate released LIBERO checkpoint:
+Two things that bite:
 
-The released `LIBERO` / `RoboTwin` evaluation managers default to `8` GPUs
-(`MULTIRUN.num_gpus=8` in `configs/sim_libero.yaml` and `configs/sim_robotwin.yaml`).
-If you want to evaluate with fewer GPUs, pass a smaller value such as
-`MULTIRUN.num_gpus=4`.
+- **`batch_size` must match the run you resume.** The sampler stores `batch_in_epoch`
+  (a batch count, not a sample count), so changing `batch_size` silently resumes from the
+  wrong position in the epoch. No error, no crash.
+- **`max_steps` is derived** when left `null`:
+  `steps/epoch = ceil(ceil(len(dataset) / (batch_size × n_gpu)) / grad_accum)`,
+  and `len(dataset)` is the **frame count**. Sliding windows overlap heavily, so "one epoch"
+  is not "every independent sample once".
+
+Full detail, including the `trainer_state.json` arithmetic for changing batch size mid-run:
+[docs/GUIDE.md](./docs/GUIDE.md).
+
+---
+
+## Deploy on TA2
+
+Read [docs/GUIDE.md](./docs/GUIDE.md) before touching a real robot. The
+short version:
+
+### GPU host — start the server
 
 ```bash
-python experiments/libero/run_libero_manager.py \
-  task=libero_uncond_2cam224_1e-4 \
-  ckpt=./checkpoints/fastwam_release/libero_uncond_2cam224.pt \
-  EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json \
-  EVALUATION.sigma_shift=5.0 \
-  MULTIRUN.num_gpus=8
+TASK=<your_task> bash start_local_serve_ws.sh 10     # 10 = denoising steps
 ```
 
-Optional: evaluate released RoboTwin checkpoint:
+`RUN` and `STEP` default to the newest run and the highest step number; override either to pin
+a specific checkpoint. Wait for `WebSocket server listening on ws://0.0.0.0:8000` before
+starting the client. Health check: `curl http://<host>:8000/healthz`.
+
+`--task` must name the config the checkpoint was **trained** with — hydra recomposes the data
+and model dimensions from it, so a mismatch fails at load time (by design; it used to fail
+much later and less clearly).
+
+### Optional — a task library for switching instructions
+
+To select among several instructions by short name at runtime, generate a task map:
 
 ```bash
-python experiments/robotwin/run_robotwin_manager.py \
-  task=robotwin_uncond_3cam_384_1e-4 \
-  ckpt=./checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt \
-  EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/robotwin_uncond_3cam_384_dataset_stats.json \
-  EVALUATION.sigma_shift=5.0 \
-  MULTIRUN.num_gpus=8
+python experiments/teleavatar_v2_deploy/server/make_task_map.py \
+  --dataset-dir data/<your_dataset>_mono \
+  --cache-dir data/text_embeds_cache/<your_task> \
+  --out taskmap.json
 ```
 
-For faster RoboTwin evaluation, we have enabled `EVALUATION.skip_get_obs_within_replan=true` in [`configs/sim_robotwin.yaml`](./configs/sim_robotwin.yaml).
-This skips RGB rendering while consecutively executing an action chunk within one replan window, which speeds up evaluation but makes the saved video look very low-FPS.
-Set it to `false` if you want to save a fully rendered video.
+Keys are derived from the dataset directory name (`_lerobot_20fps_mono` etc. stripped); a
+dataset recording several instructions gets one key per `task_index`. Add or override entries
+with `--instruction 'key=full instruction text'`. `taskmap.json` is a generated,
+per-deployment artifact and is gitignored.
 
-**Note:** We evaluate with **unseen** instructions, following Motus. [Lingbot-VA](https://github.com/Robbyant/lingbot-va/blob/661d52a59dc634a650efcd10a79d06bbb17ea81f/evaluation/robotwin/eval_polict_client_openpi.py#L308) uses **seen** instructions instead. You can try `EVALUATION.instruction_type=seen` to use **seen** instructions, which should theoretically improve performance by one or two points.
-
-## Training
-
-### 1) Precompute T5 embedding cache before training
-
-Use `scripts/precompute_text_embeds.py` to precompute embeddings for each training task:
+### Robot host — start the client
 
 ```bash
-# LIBERO
-python scripts/precompute_text_embeds.py task=libero_uncond_2cam224_1e-4
-
-# RoboTwin
-python scripts/precompute_text_embeds.py task=robotwin_uncond_3cam_384_1e-4
+cd experiments/teleavatar_v2_deploy/client
+./run_task_ws.sh <taskmap-key> --dry-run      # infer only, nothing moves
+./run_task_ws.sh <taskmap-key>                # live
+./run_task_ws.sh                              # omit the key: server's startup instruction
 ```
 
-For multi-GPU:
+**Always do a `--dry-run` pass first.** The script also records a rosbag of camera frames,
+policy action chunks and robot state for the whole session, which is what the analysis tools
+below consume.
+
+Pre-flight check: `bash experiments/teleavatar_v2_deploy/check_deployment.sh`.
+
+---
+
+## Moving checkpoints between machines
+
+A checkpoint alone is not servable. These must travel together, from the **same run**:
+
+| File | Why |
+|---|---|
+| `checkpoints/weights/step_*.pt` | the weights (~12 GB) |
+| `dataset_stats.json` | action/state normalization — mixing runs silently drifts the action scale |
+| `config.yaml` | the run's resolved config |
+| `text_embeds_cache/` entries | the conditioning, byte-identical to training |
+| `Wan2.2_VAE.safetensors` | ~1.4 GB, **not** inside the `.pt` (only `mot` + `proprio_encoder` are saved) |
+
+The DiT shards (19 GB), ActionDiT payload (2 GB) and T5 encoder (11 GB) do **not** need to be
+copied — serving sets `skip_dit_load_from_pretrain=True` and reads cached text embeddings.
+
+Two scripts move exactly that set via KS3:
 
 ```bash
-torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py task=libero_uncond_2cam224_1e-4
+# on the training server (internal endpoint)
+TASK=<task> RUN_ID=<run_id> STEP=step_<N>.pt \
+  KS3_BUCKET=ks3://<bucket>/<prefix> \
+  bash push_checkpoint_ks3.sh
+
+# on the deploy machine (public endpoint) -- same three values
+TASK=<task> RUN_ID=<run_id> STEP=step_<N>.pt \
+  KS3_BUCKET=ks3://<bucket>/<prefix> PROJECT_ROOT=/path/to/FastWAM \
+  bash pull_checkpoint.sh
 ```
 
-### 2) Training (using `fastwam` as an example)
+The pull script stages incoming `configs/` in `configs_incoming_<RUN_ID>/` rather than
+overwriting yours, and prints a diff for you to merge.
 
-When running a new task for the first time, set `pretrained_norm_stats` in the corresponding `configs/data/*.yaml` to `null` first.
-After one training run, a `dataset_stats.json` file will be generated in the current run directory (for example, `runs/{task_name}/{run_id}/dataset_stats.json`).
-You can then update `pretrained_norm_stats` to that file path for subsequent runs.
+---
+
+## Analysis tools
+
+All under `experiments/teleavatar_v2_deploy/server/`. The ones that run the model need
+`--task` plus a matching `--checkpoint` / `--dataset-stats` pair from the same run; the rest
+only read a bag or a stream.
+
+| Script | What it answers | Runs the model |
+|---|---|---|
+| `analyze_deploy_bag.py` | predicted vs commanded vs measured joint traces from a rosbag | no |
+| `joint_error_report.py` | per-joint tracking error tables | no |
+| `rtp_stream_export.py` | dump the RTP video stream to files | no |
+| `bag_visualize_and_predict.py` | re-run the policy over a recorded bag, render a comparison video | yes |
+| `offline_infer_from_export.py` | replay exported frames without a robot | yes |
+| `viz_trainset_pred_compare.py` | sanity check: prediction vs ground truth on training samples | yes |
+
+Latency:
 
 ```bash
-# LIBERO
-bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
-
-# RoboTwin
-bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
+bash bench_latency_ws.sh                      # single point, server's default instruction
+bash bench_latency_ws.sh <taskmap-key> 12     # specific task and step count
+bash bench_latency_ws.sh --sweep              # every served task × 8/10/12 steps
 ```
 
-For LIBERO, we train on a single node with 8 GPUs. For RoboTwin, we use 64 GPUs to accelerate training. You can try reducing the GPU count or training epochs.
+The sweep asks the server which tasks it serves (`available_tasks` in the connection
+metadata), so it needs no task list of its own. Denoising steps are per-request — no restart
+needed — but start the server with `--warmup-steps 8 10 12` before comparing, so every CUDA
+Graph is warm.
 
-## Inference with Your Trained Checkpoints
+---
 
-The `mujoco` environment should ideally stay consistent with the LIBERO data version. Then run LIBERO evaluation:
+## Conventions worth knowing
 
-```bash
-# LIBERO
-python experiments/libero/run_libero_manager.py task={task_name} ckpt={ckpt_path}
+**Action / state layout.** Datasets store 72-d vectors;
+`TeleavatarSelectTransform` slices them to the openpi convention:
+
+```
+raw 72-d:  positions[0:16]  = [L_arm(7), L_grip_pos, R_arm(7), R_grip_pos]
+           velocities[16:32]
+           efforts[32:48]   = [L_arm(7), L_grip_effort, R_arm(7), R_grip_effort]
+           + optional EE / chassis / ...
+
+model:     state  14-d = [L_arm(7), R_arm(7)]
+           action 16-d = [L_arm(7), L_grip, R_arm(7), R_grip]
 ```
 
-We have already copied the `RoboTwin` evaluation-related code into `third_party/RoboTwin`.
-You still need to follow the official RoboTwin instructions from the
-[RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin).
-Finish installation and download the required assets, then create the policy symlink:
+Gripper channels are **force**-controlled: the dataset stores effort in N·m, converted to a
+platform trigger in [0, 1] before normalization and converted back on the robot side.
 
-```bash
-ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwin/policy/fastwam_policy"
-```
+**Hydra composition.** `configs/train.yaml` is always the entry point; `data`, `model` and
+`task` are all `null` there, and the task config fills them in. Every task config must begin
+with `# @package _global_` — without it the keys nest under `task.` and training will not
+start. `launch_train.sh` pre-checks this.
 
-Then run RoboTwin evaluation:
+Override precedence, low to high: `train.yaml` → `data`/`model` config → task config → command
+line.
 
-```bash
-python experiments/robotwin/run_robotwin_manager.py task={task_name} ckpt={ckpt_path}
-```
+**`dataset_stats.json` belongs to its run.** Normalization vector widths are validated at load
+time, but two runs with the same dimensions and different statistics will load happily and
+produce subtly wrong actions. Never mix them.
 
-Common `task_name` examples:
+**Paths are repo-relative.** Scripts derive their own root; no absolute path is baked in.
+Override `PROJECT_ROOT` when a deploy machine uses a different layout.
 
-```text
-libero_uncond_2cam224_1e-4
-robotwin_uncond_3cam_384_1e-4
-```
+---
 
-## Acknowledgements
+## Further reading
 
-The RoboTwin evaluation code in this repository is adapted from the official [RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin). We thank the RoboTwin team for releasing their codebase and assets.
+| Document | Contents |
+|---|---|
+| [docs/GUIDE.md](./docs/GUIDE.md) | config chain in depth, resume/anneal semantics, batch-size arithmetic, checkpoint transfer, two-host deployment, safety, rosbag analysis, troubleshooting |
+| [upstream repo](https://github.com/zhou-yh19/FastWAM) | original FastWAM: LIBERO / RoboTwin training and evaluation |
 
-## BibTeX
+---
 
-If you find our work helpful, please consider citing:
+## Citation
+
+This fork adds LeRobot ingestion and TA2 deployment; the model and method are from the FastWAM
+paper. If you use this work, please cite:
 
 ```bibtex
 @article{yuan2026fastwam,
@@ -435,3 +396,6 @@ If you find our work helpful, please consider citing:
   url={https://arxiv.org/abs/2603.16666}
 }
 ```
+
+The RoboTwin evaluation code is adapted from the
+[RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin).

@@ -1,0 +1,107 @@
+# TA2 monocular (left-eye) training data template — LeRobot 2.x layout
+#
+# 1. Copy to configs/data/<your-task>.yaml
+# 2. Set dataset_dirs and text_embedding_cache_dir
+# 3. Check shape_meta.images against the transcoded video
+# 4. Reference it from a task config: `override /data: <your-task>`
+#
+# Geometry: TA2 cameras record side-by-side stereo; mono training uses the left eye only.
+#   head_camera  SBS 512x256 -> 256x256
+#   left_color   SBS 256x80  -> 128x80
+#   right_color  SBS 256x80  -> 128x80
+# Mosaic canvas 352x256 = 88 DiT tokens/frame. 352 rather than 336 because the VAE
+# downsamples 16x and the DiT patch is 2x, so the canvas must be a multiple of 32.
+#
+# Produce the *_mono videos with: DATASETS=<name> MODE=mono bash scripts/transcode.sh
+# Produce the text-embed cache with: python scripts/precompute_text_embeds.py task=<your-task>
+
+train:
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+
+  # LeRobot 2.x dataset dirs (each holding meta/ data/ videos/). Several may be listed.
+  dataset_dirs:
+    - ./data/REPLACE_WITH_YOUR_DATASET_mono
+
+  # Must match the actual video resolution. A mismatch produces silently wrong results.
+  shape_meta:
+    images:
+      - key: head_camera
+        raw_shape: [3, 256, 256]
+        shape: [3, 256, 256]
+
+      - key: left_color
+        raw_shape: [3, 80, 128]
+        shape: [3, 80, 128]
+
+      - key: right_color
+        raw_shape: [3, 80, 128]
+        shape: [3, 80, 128]
+
+    action:
+      - key: default
+        raw_shape: 72              # raw vector, incl. EE / chassis
+        shape: 16                  # after TeleavatarSelectTransform
+
+    state:
+      - key: default
+        raw_shape: 72
+        shape: 14                  # after TeleavatarSelectTransform
+
+  # --- sampling ---
+  num_frames: 33                   # frames per sample (incl. 1 action offset)
+  global_sample_stride: 1          # 1 = no frame skipping
+  action_video_freq_ratio: 4       # video tokens per action token
+
+  video_size: [352, 256]           # canvas size; must match the processor below
+  concat_multi_camera: null        # keep null for the ta2 mosaic
+
+  camera_key: null
+  val_set_proportion: 0.0          # 0 = no held-out split
+  is_training_set: true
+  skip_padding_as_possible: false
+  max_padding_retry: 3
+
+  # null on a fresh run: stats are computed at startup and saved to the run dir.
+  # When resuming, point this at the original run's dataset_stats.json.
+  pretrained_norm_stats: null
+
+  # Geometry here must agree with shape_meta and video_size above.
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+
+    num_output_cameras: 1
+    camera_mosaic: ta2
+    ta2_canvas_size: [352, 256]    # must be a multiple of 32
+    ta2_head_tile: [256, 256]
+    ta2_wrist_tile: [80, 128]
+    ta2_fill: 0.5                  # canvas padding value, before [-1,1] normalization
+
+    action_output_dim: 16
+    proprio_output_dim: 14
+    delta_action_dim_mask: null
+
+    action_state_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.teleavatar.TeleavatarSelectTransform
+        keys: [default]
+        convert_gripper_to_trigger: true   # gripper effort (N*m) -> trigger [0,1]
+
+    use_stepwise_action_norm: false
+    norm_default_mode: min/max
+    norm_exception_mode: null
+
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+
+  # Cache filename is sha256 of the formatted prompt, so any wording change (whitespace
+  # included) yields a file the trainer will not find.
+  text_embedding_cache_dir: ./data/text_embeds_cache/REPLACE_WITH_YOUR_TASK
+  context_len: 128

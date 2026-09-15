@@ -3,13 +3,17 @@ import json
 import inspect
 import os
 import re
+import traceback
+from datetime import timedelta
 from math import ceil
 from pathlib import Path
 import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from accelerate import Accelerator
+from accelerate.utils import InitProcessGroupKwargs
 from omegaconf import DictConfig
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
@@ -23,6 +27,46 @@ from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
 logger = get_logger(__name__)
+
+# Rank-local logger: `get_logger` disables non-zero ranks, which is right for progress
+# spam but wrong for a crash report -- the rank that fails is usually not rank 0.
+_rank_logger = logging.getLogger(f"{__name__}.rank")
+
+
+class _CollectiveGuard:
+    """Convert a single-rank exception into a whole-job abort.
+
+    See `Wan22Trainer._guard_collectives`. On the way out of a `with` block that raised, this
+    prints the traceback tagged with the failing rank and then calls `dist.destroy_process_
+    group()`, which makes the peers' in-flight collectives fail fast instead of hanging for
+    the full watchdog timeout. The original exception is left to propagate.
+    """
+
+    def __init__(self, trainer, what: str):
+        self._trainer = trainer
+        self._what = what
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            return False
+        rank = self._trainer.accelerator.process_index
+        _rank_logger.error(
+            "[rank %d] Exception inside `%s`, which sits between collectives. "
+            "Aborting the process group so peers fail fast instead of hanging until the "
+            "NCCL watchdog fires.\n%s",
+            rank,
+            self._what,
+            "".join(traceback.format_exception(exc_type, exc, tb)),
+        )
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:  # pragma: no cover - best effort teardown on an already-failing path
+            _rank_logger.exception("[rank %d] Failed to destroy the process group.", rank)
+        return False
 
 
 class Wan22Trainer:
@@ -43,11 +87,39 @@ class Wan22Trainer:
         self.save_every = int(cfg.save_every)
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+        # Eval-only knobs. Read with defaults so older configs/checkpoints still load.
+        # `eval_seed` is deliberately decoupled from `cfg.seed` (which drives training data
+        # order) so that pinning the eval set does not perturb training.
+        self.eval_seed = int(getattr(cfg, "eval_seed", 12345))
+        self.eval_num_loss_timesteps = int(getattr(cfg, "eval_num_loss_timesteps", 5))
+        self.eval_num_loss_samples = int(getattr(cfg, "eval_num_loss_samples", 2))
+        if self.eval_num_loss_timesteps < 1:
+            raise ValueError(
+                f"`eval_num_loss_timesteps` must be >= 1, got {self.eval_num_loss_timesteps}."
+            )
+        if self.eval_num_loss_samples < 1:
+            raise ValueError(
+                f"`eval_num_loss_samples` must be >= 1, got {self.eval_num_loss_samples}."
+            )
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
+        # After accelerate-state resume: keep weights/opt momentum/data progress,
+        # but rebuild LR schedule from cfg.learning_rate for the remaining steps.
+        self.resume_reinit_lr = bool(getattr(cfg, "resume_reinit_lr", False))
+        # Warmup fraction used when rebuilding that schedule. The default 5% suits dropping to
+        # a *lower* peak after a plateau. A pure anneal-to-zero tail wants 0.0 instead: there
+        # the peak is the LR the checkpoint already carries, so re-warming would first crash
+        # the LR to peak/warmup_steps and climb back, undoing the anneal for those steps.
+        self.resume_warmup_frac = float(getattr(cfg, "resume_warmup_frac", 0.05))
+        if not 0.0 <= self.resume_warmup_frac < 1.0:
+            raise ValueError(
+                f"`resume_warmup_frac` must be in [0.0, 1.0), got {self.resume_warmup_frac}."
+            )
+        additional_steps = getattr(cfg, "additional_steps", None)
+        self.additional_steps = int(additional_steps) if additional_steps is not None else None
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
         if self.mixed_precision not in {"no", "fp16", "bf16"}:
             raise ValueError(
@@ -56,12 +128,31 @@ class Wan22Trainer:
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
 
+        # How long a collective may stall before the NCCL watchdog aborts the job. The old
+        # default was DeepSpeed's 30 min, which meant a rank-divergence hang burned half an
+        # hour of 8 GPUs before saying anything.
+        self.dist_timeout_sec = int(getattr(cfg, "dist_timeout_sec", 600))
+        if self.dist_timeout_sec < 60:
+            raise ValueError(
+                f"`dist_timeout_sec` must be >= 60, got {self.dist_timeout_sec}."
+            )
+        # `InitProcessGroupKwargs.to_kwargs()` only forwards fields that *differ* from its
+        # own defaults, and its nccl default is exactly 600s. Requesting 600 would therefore
+        # forward nothing and let DeepSpeed fall back to its own 1800s default -- the silent
+        # trap behind the `Timeout(ms)=1800000` in the step-10500 hang. Nudge by 1s so the
+        # value always survives the filter and the configured number is the one in effect.
+        forwarded_timeout = self.dist_timeout_sec
+        if forwarded_timeout == 600:
+            forwarded_timeout = 601
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
+            kwargs_handlers=[
+                InitProcessGroupKwargs(timeout=timedelta(seconds=forwarded_timeout))
+            ],
         )
-        
+
         logger.info(
             "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
             self.accelerator.distributed_type,
@@ -116,29 +207,6 @@ class Wan22Trainer:
         ensure_dir(self.weights_dir)
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
-
-        if bool(getattr(self.model, "compile_training_denoise", False)):
-            logger.info("Compiling training denoise forward/backward before DeepSpeed initialization.")
-            compile_start = time.perf_counter()
-            warmup_loader = DataLoader(
-                self.train_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                sampler=self.train_sampler,
-                num_workers=0,
-            )
-            warmup_sample = next(iter(warmup_loader))
-            with self.accelerator.autocast():
-                warmup_loss, _ = self.model.training_loss(warmup_sample)
-            warmup_loss.backward()
-            self.optimizer.zero_grad(set_to_none=True)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(self.accelerator.device)
-            logger.info(
-                "Finished training denoise compile warmup in %.2f seconds.",
-                time.perf_counter() - compile_start,
-            )
-            set_global_seed(self.seed)
 
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
@@ -299,6 +367,67 @@ class Wan22Trainer:
         logger.info("Loading weight checkpoint only: %s", resume)
         self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+        if self.resume_reinit_lr or self.additional_steps is not None:
+            logger.warning(
+                "resume_reinit_lr / additional_steps only apply to accelerate state/ resume; "
+                "weight-only .pt resume already builds a fresh LR schedule and resets data progress."
+            )
+
+    def _maybe_reinit_lr_after_state_resume(self) -> None:
+        """Keep Adam momentum + dataloader cursor; optionally rebuild LR at cfg.learning_rate.
+
+        Use after a loss plateau when you want a lower peak LR without reshuffling data.
+        Extend the run with additional_steps=N (preferred) or a larger absolute max_steps.
+        """
+        if self.additional_steps is not None:
+            self.max_steps = int(self.global_step) + int(self.additional_steps)
+            logger.info(
+                "Extended max_steps -> %d (global_step=%d + additional_steps=%d)",
+                self.max_steps,
+                self.global_step,
+                self.additional_steps,
+            )
+
+        if not self.resume_reinit_lr:
+            if self.max_steps is not None and self.global_step >= self.max_steps:
+                logger.warning(
+                    "Resumed at global_step=%d with max_steps=%d; training will exit immediately. "
+                    "Set additional_steps=N or a larger max_steps to continue.",
+                    self.global_step,
+                    self.max_steps,
+                )
+            return
+
+        if self.max_steps is None:
+            raise ValueError(
+                "resume_reinit_lr=true requires max_steps (or additional_steps) so the "
+                "remaining cosine/warmup horizon is well-defined."
+            )
+        if self.global_step >= self.max_steps:
+            raise ValueError(
+                f"Cannot reinit LR: global_step={self.global_step} >= max_steps={self.max_steps}. "
+                "Pass additional_steps=N (recommended) or set max_steps > current step."
+            )
+
+        remaining = int(self.max_steps) - int(self.global_step)
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.learning_rate
+            group["initial_lr"] = self.learning_rate
+
+        warmup_steps = int(remaining * self.resume_warmup_frac)
+        self.scheduler = self._build_scheduler(
+            scheduler_type=self.cfg.lr_scheduler_type,
+            total_train_steps=remaining,
+            warmup_steps=warmup_steps,
+        )
+        logger.info(
+            "Rebuilt LR after state resume: peak_lr=%s remaining_steps=%d warmup=%d "
+            "(warmup_frac=%.3f, optimizer momentum + dataloader progress kept)",
+            self.learning_rate,
+            remaining,
+            warmup_steps,
+            self.resume_warmup_frac,
+        )
 
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
@@ -396,6 +525,150 @@ class Wan22Trainer:
             "action_horizon": action_horizon,
         }
 
+    def _barrier(self):
+        """`wait_for_everyone` that does not depend on any per-rank value."""
+        self.accelerator.wait_for_everyone()
+
+    def _train_metric_keys(self, loss_dict):
+        """Key order for the packed per-step metric gather, pinned on the first optimizer step.
+
+        The gathered row must have the same width on every rank at every step. Pinning the key
+        set the first time we see it and then requiring an exact match turns a drifting
+        `loss_dict` into an immediate, readable error on the rank that drifted, instead of a
+        silent shape mismatch that hangs the whole group inside NCCL.
+        """
+        keys = tuple(sorted(loss_dict))
+        pinned = getattr(self, "_pinned_train_metric_keys", None)
+        if pinned is None:
+            self._pinned_train_metric_keys = keys
+            return keys
+        if keys != pinned:
+            raise RuntimeError(
+                f"[rank {self.accelerator.process_index}] `training_loss` returned loss_dict "
+                f"keys {keys}, but this run pinned {pinned} at its first step. The gathered "
+                "metric width must be identical on every rank and every step."
+            )
+        return pinned
+
+    def _agree_bool(self, local_ok: bool, what: str) -> bool:
+        """Turn a per-rank boolean into a value every rank agrees on.
+
+        Any `if <local condition>` around a collective is a deadlock: the ranks that take
+        the branch enqueue work the others never do, and NCCL waits until the watchdog
+        kills the job. Routing the condition through a single fixed-shape all-reduce means
+        every rank leaves this function with the *same* answer, so the branch is safe.
+
+        Returns True only when the condition held on every rank.
+        """
+        flag = torch.tensor(
+            [1.0 if local_ok else 0.0],
+            device=self.accelerator.device,
+            dtype=torch.float32,
+        )
+        agreed = self.accelerator.reduce(flag, reduction="sum")
+        num_ok = int(agreed.item())
+        world = self.accelerator.num_processes
+        if 0 < num_ok < world:
+            logger.warning(
+                "Rank divergence on `%s`: %d/%d ranks reported True. "
+                "Treating it as False everywhere to keep collectives aligned.",
+                what,
+                num_ok,
+                world,
+            )
+        return num_ok == world
+
+    def _guard_collectives(self, what: str):
+        """Abort the whole job if one rank raises where others are about to communicate.
+
+        A bare exception on a single rank is as fatal as a shape mismatch and looks worse in
+        the logs: the raising rank unwinds and stops calling collectives, the other seven sit
+        in an all-reduce until the watchdog fires, and the traceback that explains it is
+        buried in whichever rank's stream nobody is tailing. This logs the traceback with its
+        rank, then tears the process group down so every rank exits promptly with a cause.
+        """
+        return _CollectiveGuard(self, what)
+
+    def _fixed_eval_indices(self):
+        """Sample indices used by `evaluate`, pinned for the lifetime of the run.
+
+        The seed deliberately excludes `global_step`, so every eval scores the *same*
+        samples. Without this, the step-to-step movement of the eval curves is dominated
+        by which samples happened to be drawn rather than by the model changing.
+        """
+        num_samples = min(self.eval_num_loss_samples, len(self.val_dataset))
+        rng = torch.Generator(device="cpu").manual_seed(self.eval_seed + self.accelerator.process_index)
+        # Collisions are possible but harmless (they just reweight the average) and
+        # vanishingly rare for realistic dataset sizes.
+        return torch.randint(0, len(self.val_dataset), (num_samples,), generator=rng).tolist()
+
+    # Loss components broken out on the eval grid, in a fixed order so the gathered metric
+    # tensor has the same layout on every rank.
+    EVAL_LOSS_COMPONENTS = ("total", "loss_video", "loss_action")
+
+    def _fixed_grid_val_loss(self, model, samples):
+        """`val_loss` on a deterministic timestep grid, split into video/action.
+
+        `training_loss` normally draws a fresh random timestep per call, and the flow-matching
+        loss varies strongly with that timestep -- the `training_weight` alone has a ~68% CV
+        under the training distribution, which is most of the noise in the logged curve. Here
+        the timesteps come from `build_training_t_grid`, a deterministic quantile grid over
+        that same distribution, and the noise is pinned by a seeded generator. Same weights +
+        same samples => same number, every time.
+
+        The split matters because `loss_total = loss_video + loss_action` and the two move on
+        very different scales; a combined number hides what the video branch is doing.
+
+        Returns `{component: per_timestep_means}` for *every* component in
+        `EVAL_LOSS_COMPONENTS`, with NaN in the slots the model did not report. The width is
+        therefore identical on every rank, which is what makes the gather in `evaluate` safe.
+        """
+        t_grid = model.train_video_scheduler.build_training_t_grid(
+            self.eval_num_loss_timesteps,
+            device=model.device,
+            dtype=torch.float32,
+        )
+        # A generator must sit on the exact device the noise is drawn on. `model.device` is
+        # normally `cuda:<local_rank>`, but a bare `cuda` would silently resolve to the
+        # current device and mismatch on non-zero ranks.
+        generator_device = model.device
+        if generator_device.type == "cuda" and generator_device.index is None:
+            generator_device = torch.device("cuda", torch.cuda.current_device())
+
+        per_timestep = {key: [] for key in self.EVAL_LOSS_COMPONENTS}
+        for t in t_grid:
+            accumulated = {key: [] for key in self.EVAL_LOSS_COMPONENTS}
+            for sample_idx, sample in enumerate(samples):
+                # Re-seeded per (timestep, sample), so a given sample sees the same noise at
+                # every timestep and at every eval -- common random numbers across the grid.
+                generator = torch.Generator(device=generator_device).manual_seed(
+                    self.eval_seed + sample_idx
+                )
+                with self.accelerator.autocast():
+                    loss, loss_dict = model.training_loss(
+                        sample,
+                        timestep_video=t,
+                        timestep_action=t,
+                        generator=generator,
+                    )
+                accumulated["total"].append(loss.float().item())
+                for key in self.EVAL_LOSS_COMPONENTS[1:]:
+                    if key in loss_dict:
+                        accumulated[key].append(float(loss_dict[key]))
+            for key, values in accumulated.items():
+                # A component the model does not report stays NaN here. Unlike before, the
+                # entry is still *present*: dropping keys locally made the gathered tensor's
+                # width rank-dependent, which is a deadlock (see `evaluate`). NaN is the
+                # sentinel and it is filtered after the gather, identically on every rank.
+                per_timestep[key].append(sum(values) / len(values) if values else float("nan"))
+
+        # Always the full `EVAL_LOSS_COMPONENTS` x `eval_num_loss_timesteps` grid, so the
+        # layout is a function of config alone -- never of what this rank's samples contained.
+        assert all(
+            len(values) == len(t_grid) for values in per_timestep.values()
+        ), f"eval loss grid is ragged: { {k: len(v) for k, v in per_timestep.items()} }"
+        return per_timestep
+
     @torch.no_grad()
     def evaluate(self):
         if self.val_dataset is None:
@@ -405,16 +678,16 @@ class Wan22Trainer:
         was_dit_training = model.dit.training
         model.eval()
 
-        # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
-        rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
-        eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
-        sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+        eval_indices = self._fixed_eval_indices()
+        samples = [self._to_batched_eval_sample(self.val_dataset[i]) for i in eval_indices]
 
-        # 1. training loss
-        with self.accelerator.autocast():
-            val_loss, _ = model.training_loss(sample)
-            val_loss = val_loss.float().item()
-        
+        # 1. training loss, on a fixed timestep grid over all pinned samples.
+        loss_by_component = self._fixed_grid_val_loss(model, samples)
+        val_loss_per_timestep = loss_by_component["total"]
+        val_loss = sum(val_loss_per_timestep) / len(val_loss_per_timestep)
+
+        # The rollout below is far more expensive than the loss, so it stays on one sample.
+        sample = samples[0]
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
@@ -548,6 +821,29 @@ class Wan22Trainer:
         )
         save_mp4(stitched_frames, video_path, fps=8)
 
+        # --- Gathered metric layout -------------------------------------------------------
+        # The width below is a pure function of `EVAL_LOSS_COMPONENTS` and
+        # `eval_num_loss_timesteps`, both of which come from config and are therefore
+        # identical on every rank. Nothing here may depend on what *this* rank's samples
+        # happened to contain: a rank-dependent width makes the all-gather shapes disagree,
+        # which hangs every rank until the NCCL watchdog kills the job. That is exactly the
+        # failure that killed the 2026-08-29 run at step 10500.
+        #
+        #   [0:7]   scalar video/loss metrics
+        #   [7:9]   action_l2, action_l1 (NaN when this rank has no action metrics)
+        #   [9:]    per-component per-timestep losses, `EVAL_LOSS_COMPONENTS` order,
+        #           `eval_num_loss_timesteps` values each, NaN where not reported
+        num_t = self.eval_num_loss_timesteps
+        component_block = []
+        for key in self.EVAL_LOSS_COMPONENTS:
+            values = loss_by_component.get(key) or []
+            if len(values) != num_t:
+                raise RuntimeError(
+                    f"Eval loss component `{key}` has {len(values)} timesteps, expected "
+                    f"{num_t}. The gathered metric width must not vary across ranks."
+                )
+            component_block.extend(float(v) for v in values)
+
         local_metrics = torch.tensor(
             [
                 float(val_loss),
@@ -557,16 +853,39 @@ class Wan22Trainer:
                 float(ssim_rollout_vs_decode),
                 float(psnr_decode_vs_gt),
                 float(ssim_decode_vs_gt),
-                float(action_l2) if action_l2 is not None else -1.0,
-                float(action_l1) if action_l1 is not None else -1.0,
+                # NaN rather than -1.0: a missing value must not be averaged in as data.
+                float(action_l2) if action_l2 is not None else float("nan"),
+                float(action_l1) if action_l1 is not None else float("nan"),
+                *component_block,
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
         ).unsqueeze(0)
+        expected_width = 9 + len(self.EVAL_LOSS_COMPONENTS) * num_t
+        assert local_metrics.shape == (1, expected_width), (
+            f"eval metric tensor is {tuple(local_metrics.shape)}, expected (1, {expected_width})"
+        )
+
+        # `_agree_bool` is itself a fixed-shape collective, so it is safe to call before the
+        # gather; it replaces the old `action_l2 is not None` local branch below.
+        has_action_metrics = self._agree_bool(action_l2 is not None, "eval action metrics")
+
         gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
         mean_metrics = gathered_metrics[:, :7].mean(dim=0)
-        action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
-        action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+        action_l2_mean = gathered_metrics[:, 7].mean().item() if has_action_metrics else None
+        action_l1_mean = gathered_metrics[:, 8].mean().item() if has_action_metrics else None
+
+        # Unpack the fixed-width block. Filtering happens *here*, on the gathered result, so
+        # every rank drops exactly the same components.
+        component_means = {}
+        offset = 9
+        for key in self.EVAL_LOSS_COMPONENTS:
+            block = gathered_metrics[:, offset : offset + num_t]
+            offset += num_t
+            if bool(torch.isnan(block).any()):
+                # Not reported by the model (or not by some rank) -- skip it everywhere.
+                continue
+            component_means[key] = block.mean(dim=0).tolist()
 
         if was_dit_training:
             self._set_dit_only_train_mode()
@@ -579,6 +898,16 @@ class Wan22Trainer:
             "ssim_rd": float(mean_metrics[4].item()),
             "psnr_dg": float(mean_metrics[5].item()),
             "ssim_dg": float(mean_metrics[6].item()),
+            "val_loss_per_timestep": [float(v) for v in component_means.get("total", [])],
+            # e.g. {"loss_video": {"mean": .., "per_timestep": [..]}, "loss_action": {...}}
+            "val_loss_components": {
+                key: {
+                    "mean": sum(values) / len(values),
+                    "per_timestep": [float(v) for v in values],
+                }
+                for key, values in component_means.items()
+                if key != "total" and values
+            },
             "video_path": video_path,
         }
         if action_l2_mean is not None:
@@ -606,18 +935,23 @@ class Wan22Trainer:
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
 
-        self.accelerator.wait_for_everyone()
-        ckpt_path = None
-        if self.accelerator.is_main_process:
-            ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
-        self.accelerator.wait_for_everyone()
+        # The rank-0-only writes below sit between barriers: if one of them raises (disk full,
+        # bad path, serialization error) rank 0 stops calling collectives while the other
+        # ranks wait in `wait_for_everyone`, and the job hangs rather than reporting the disk
+        # error. The guard turns that into a prompt, attributable failure.
+        with self._guard_collectives("save_checkpoint"):
+            self._barrier()
+            ckpt_path = None
+            if self.accelerator.is_main_process:
+                ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
+            self._barrier()
 
-        state_path = os.path.join(self.state_dir, step_tag)
-        ensure_dir(state_path)
-        self.accelerator.save_state(output_dir=state_path)
-        if self.accelerator.is_main_process:
-            self._save_trainer_state(state_path)
-        self.accelerator.wait_for_everyone()
+            state_path = os.path.join(self.state_dir, step_tag)
+            ensure_dir(state_path)
+            self.accelerator.save_state(output_dir=state_path)
+            if self.accelerator.is_main_process:
+                self._save_trainer_state(state_path)
+            self._barrier()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 
@@ -648,6 +982,7 @@ class Wan22Trainer:
                     "State file does not contain `epoch`/`batch_in_epoch`; "
                     "optimizer/scheduler were restored, but dataloader progress resume is skipped."
                 )
+            self._maybe_reinit_lr_after_state_resume()
             self.accelerator.wait_for_everyone()
             return
 
@@ -659,12 +994,13 @@ class Wan22Trainer:
         self.epoch = 0
         self.batch_in_epoch = 0
         self.train_sampler.clear_resume_batch_offset()
-        self.accelerator.wait_for_everyone()
         logger.info("Loaded accelerate training state from %s at step=%d", state_dir, self.global_step)
         logger.warning(
             "State file `%s` is missing; dataloader progress resume is skipped.",
             state_file,
         )
+        self._maybe_reinit_lr_after_state_resume()
+        self.accelerator.wait_for_everyone()
 
     def train(self):
         self._set_dit_only_train_mode()
@@ -680,6 +1016,7 @@ class Wan22Trainer:
         self.run_start_time = time.perf_counter()
 
         while self.global_step < self.max_steps:
+            step_start_time = time.perf_counter()
             try:
                 sample = next(data_iter)
                 self.batch_in_epoch += 1
@@ -689,6 +1026,11 @@ class Wan22Trainer:
                 self.train_sampler.clear_resume_batch_offset()
                 data_iter = iter(self.train_loader)
                 continue
+            # Time spent blocked on the dataloader. Under DDP the fast ranks then burn this
+            # same wall-clock spinning inside the NCCL collective waiting for the slow one,
+            # so this is gathered as both mean and max below: max >> mean means a single
+            # straggler rank, both large means the input pipeline is globally too slow.
+            data_wait_sec = time.perf_counter() - step_start_time
 
             with self.accelerator.accumulate(self.model):
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
@@ -704,17 +1046,44 @@ class Wan22Trainer:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
-                    global_loss = float(
-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
-                    )
-                    global_loss_metrics = {}
-                    for key, value in loss_dict.items():
-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
-                        global_loss_metrics[key] = float(
-                            self.accelerator.gather(metric_tensor).mean().item()
-                        )
-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
-                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+                    # One gather of a fixed-width row, not one gather per `loss_dict` key.
+                    # The old loop issued `len(loss_dict)` collectives, so a rank whose
+                    # `loss_dict` had a different key set would issue a different *number* of
+                    # collectives and desynchronise the group for the rest of the run --
+                    # matching the step-10500 hang, where six ranks had enqueued one more
+                    # collective (52558) than ranks 0 and 4 (52557).
+                    metric_keys = self._train_metric_keys(loss_dict)
+                    global_loss_row = torch.tensor(
+                        [
+                            float(loss.detach()),
+                            float(grad_norm),
+                            *[float(loss_dict[key]) for key in metric_keys],
+                        ],
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ).reshape(1, -1)
+                    gathered_loss_row = self.accelerator.gather(global_loss_row)
+                    row_means = gathered_loss_row.mean(dim=0)
+                    global_loss = float(row_means[0].item())
+                    global_grad_norm = float(row_means[1].item())
+                    global_loss_metrics = {
+                        key: float(row_means[2 + i].item()) for i, key in enumerate(metric_keys)
+                    }
+
+                    # Measured after the gather above, whose `.item()` forces a CUDA sync,
+                    # so this covers real compute rather than just kernel launches.
+                    step_total_sec = time.perf_counter() - step_start_time
+                    timing_tensor = torch.tensor(
+                        [data_wait_sec, step_total_sec], device=loss.device, dtype=torch.float32
+                    ).reshape(1, 2)
+                    gathered_timing = self.accelerator.gather(timing_tensor)
+                    data_wait_mean = float(gathered_timing[:, 0].mean().item())
+                    data_wait_max = float(gathered_timing[:, 0].max().item())
+                    step_total_mean = float(gathered_timing[:, 1].mean().item())
+                    # The slowest rank sets the pace for the whole step, so its wait is what
+                    # actually costs wall-clock.
+                    compute_sec = max(0.0, step_total_mean - data_wait_max)
+                    data_wait_frac = (data_wait_max / step_total_mean) if step_total_mean > 0 else 0.0
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
@@ -729,11 +1098,24 @@ class Wan22Trainer:
                         if global_loss_metrics:
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
                             description += detail_str + " "
+                        # `global_step` is an optimizer step; include accumulation in
+                        # throughput so samples/s reports effective samples processed.
+                        effective_batch_size = (
+                            self.batch_size
+                            * self.accelerator.num_processes
+                            * self.gradient_accumulation_steps
+                        )
                         description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
                             current_lr,
                             steps_per_sec,
-                            steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            steps_per_sec * effective_batch_size,
                             eta_str,
+                        )
+                        description += " data_wait=%.1fs/%.1fs(mean/max) compute=%.1fs stall=%.0f%%" % (
+                            data_wait_mean,
+                            data_wait_max,
+                            compute_sec,
+                            100.0 * data_wait_frac,
                         )
                         logger.info(description)
 
@@ -742,7 +1124,12 @@ class Wan22Trainer:
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
-                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            "performance/samples_per_sec": steps_per_sec * effective_batch_size,
+                            "performance/data_wait_sec_mean": data_wait_mean,
+                            "performance/data_wait_sec_max": data_wait_max,
+                            "performance/data_wait_frac": data_wait_frac,
+                            "performance/compute_sec": compute_sec,
+                            "performance/step_total_sec": step_total_mean,
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
@@ -753,8 +1140,13 @@ class Wan22Trainer:
                         and self.val_dataset is not None
                         and self.global_step % self.eval_every == 0
                     ):
-                        metrics = self.evaluate()
-                        self.accelerator.wait_for_everyone()
+                        # `evaluate` runs inference, VAE decode and mp4 encode per rank before
+                        # its gather. Anything that raises in there (a corrupt val shard, a
+                        # bad frame, a full disk) would otherwise leave the peers stuck in the
+                        # gather until the watchdog fires.
+                        with self._guard_collectives("evaluate"):
+                            metrics = self.evaluate()
+                        self._barrier()
                         if metrics is not None and self.accelerator.is_main_process:
                             description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
                                 self.global_step,
@@ -762,10 +1154,18 @@ class Wan22Trainer:
                                 metrics["psnr_rd"],
                                 metrics["ssim_rd"],
                             )
+                            components = metrics.get("val_loss_components") or {}
+                            for key in sorted(components):
+                                description += " val_%s=%.4f" % (key, components[key]["mean"])
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
                                 description += " action_l1=%.4f" % metrics["action_l1"]
+                            per_timestep = metrics.get("val_loss_per_timestep") or []
+                            if per_timestep:
+                                description += " val_loss_by_t=[%s]" % ", ".join(
+                                    "%.4f" % v for v in per_timestep
+                                )
                             logger.info(description)
                             eval_payload = {
                                 "eval/val_loss": float(metrics["val_loss"]),
@@ -776,6 +1176,16 @@ class Wan22Trainer:
                                 "eval/psnr_dg": float(metrics["psnr_dg"]),
                                 "eval/ssim_dg": float(metrics["ssim_dg"]),
                             }
+                            # Bucketed by noise level, low-noise first (see
+                            # `build_training_t_grid`): shows *where* the model improves.
+                            for i, value in enumerate(per_timestep):
+                                eval_payload[f"eval/val_loss_t{i}"] = float(value)
+                            # Video/action split -- the combined val_loss is dominated by
+                            # whichever branch is larger, so each gets its own curve.
+                            for key, entry in components.items():
+                                eval_payload[f"eval/val_{key}"] = float(entry["mean"])
+                                for i, value in enumerate(entry["per_timestep"]):
+                                    eval_payload[f"eval/val_{key}_t{i}"] = float(value)
                             if "action_l2" in metrics:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
